@@ -1,0 +1,94 @@
+# Smart Probe ESP32-S3 Master Pin Allocation
+
+> **Board:** ESP32-S3 DevKitC-1
+> **Firmware Version:** Smart Probe Prototype v1
+
+---
+
+# I²C Devices
+
+| Peripheral | GPIO | Notes |
+|------------|------|-------|
+| OLED SDA | 21 | Shared I²C bus |
+| OLED SCL | 20 | Shared I²C bus |
+| BME688 SDA | 21 | Shared with OLED |
+| BME688 SCL | 20 | Shared with OLED |
+
+---
+
+# UART Communication
+
+| Peripheral | GPIO | Notes |
+|------------|------|-------|
+| SIM800L TX | GPIO 9 | Connects to ESP32 RX |
+| SIM800L RX | GPIO 10 | Connects to ESP32 TX |
+
+---
+
+# Actuators
+
+| Peripheral | GPIO | Status |
+|------------|------|--------|
+| Micro Diaphragm Pump | _____ | Verify |
+| Micro Fan | GPIO 4 | Implemented |
+| Active Buzzer | GPIO 18 | Implemented |
+
+---
+
+# Status LEDs
+
+| LED | GPIO |
+|-----|------|
+| Green LED | GPIO 15 |
+| Yellow LED | GPIO 16 |
+| Red LED | GPIO 17 |
+
+---
+
+# Push Buttons
+
+| Button | GPIO | Status |
+|---------|------|--------|
+| Inspect | _____ | Verify |
+| Override | _____ | Verify |
+| Reset | _____ | Verify |
+
+---
+
+# Analog Inputs
+
+| Peripheral | GPIO | Notes |
+|------------|------|-------|
+| Battery Voltage Monitor | _____ | ADC Pin |
+
+---
+
+# Power
+
+| Signal | Connection |
+|---------|------------|
+| VIN | Battery / USB-C |
+| 3.3V | ESP32 Logic Supply |
+| GND | Common Ground |
+
+---
+
+# Reserved GPIOs
+
+| GPIO | Reserved For |
+|------|--------------|
+| _____ | Future Expansion |
+
+---
+
+# Notes
+
+- OLED and BME688 share the same I²C bus.
+- SIM800L communicates over UART.
+- Pump and fan are enabled only during **Critical** Guardian status.
+- LEDs indicate:
+  - Green → Safe
+  - Yellow → Warning
+  - Red → Critical
+- Buzzer sounds according to Guardian status.
+- Battery voltage is monitored by the ESP32 ADC.
