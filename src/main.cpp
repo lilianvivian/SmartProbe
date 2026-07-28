@@ -61,6 +61,7 @@ delay(300);
 void loop()
 {
     updateSystem();
+    updateButtons();
 
     delay(1000);
 }

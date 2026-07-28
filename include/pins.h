@@ -6,8 +6,8 @@
 #define SCL_PIN 20
 
 // GSM
-#define GSM_TX_PIN 9
-#define GSM_RX_PIN 10
+#define GSM_TX_PIN 48
+#define GSM_RX_PIN 47
 
 // LEDs
 #define GREEN_LED 15
@@ -28,9 +28,9 @@
 #define BUZZER_PIN 18
 
 // Buttons
-#define INSPECT_BUTTON 35
-#define MODE_BUTTON 36
-#define POWER_BUTTON 37
+#define INSPECT_BUTTON 38
+#define MODE_BUTTON 39
+#define POWER_BUTTON 40
 
 // Battery
 #define BATTERY_ADC 11

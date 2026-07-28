@@ -11,4 +11,6 @@ bool checkModule();
 
 void processGSM();
 
+String sendCommand(String command, uint32_t timeout= 2000);
+
 #endif

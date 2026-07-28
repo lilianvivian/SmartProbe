@@ -1,12 +1,28 @@
 #include <Arduino.h>
 #include "buttons.h"
 #include "pins.h"
+#include "events.h"
 
 
 
-bool inspectFlag = false;
-bool modeFlag = false;
-bool powerFlag = false;
+const unsigned long debounceDelay = 30;
+const unsigned long longPressTime = 2000;
+
+struct ButtonState
+{
+    bool lastReading = HIGH;
+    bool stableState = HIGH;
+
+    unsigned long lastDebounceTime = 0;
+
+    unsigned long pressedTime = 0;
+
+    bool longReported = false;
+};
+
+ButtonState inspectButton;
+ButtonState modeButton;
+ButtonState powerButton;
 
 void initButtons()
 {
@@ -15,59 +31,92 @@ void initButtons()
     pinMode(POWER_BUTTON, INPUT_PULLUP);
 }
 
+void processButton(
+    int pin,
+    ButtonState &button
+    )
+{
+    bool reading = digitalRead(pin);
+
+    if (reading != button.lastReading)
+    {
+        button.lastDebounceTime = millis();
+    }
+
+    if ((millis() - button.lastDebounceTime) > debounceDelay)
+    {
+        if (reading != button.stableState)
+        {
+            button.stableState = reading;
+
+            // Button pressed
+            if (button.stableState == LOW)
+            {
+                button.pressedTime = millis();
+                button.longReported = false;
+            }
+
+            // Button released
+            else
+            {
+                if (!button.longReported)
+                {
+                    switch (pin)
+                {
+                    case INSPECT_BUTTON:
+                        postEvent(EVENT_INSPECT_SHORT);
+                        break;
+
+                    case MODE_BUTTON:
+                        postEvent(EVENT_MODE_SHORT);
+                        break;
+
+                    case POWER_BUTTON:
+                        postEvent(EVENT_POWER_SHORT);
+                        break;
+                }
+
+            }
+        }
+
+        // Long press
+        if (button.stableState == LOW &&
+            !button.longReported &&
+            (millis() - button.pressedTime >= longPressTime))
+        {
+            button.longReported = true;
+            switch (pin)
+            {
+                case INSPECT_BUTTON:
+                    postEvent(EVENT_INSPECT_LONG);
+                    break;
+
+                case MODE_BUTTON:
+                    postEvent(EVENT_MODE_LONG);
+                    break;
+
+                case POWER_BUTTON:
+                    postEvent(EVENT_POWER_LONG);
+                    break;
+            }
+        }
+    }
+
+    button.lastReading = reading;
+}
+}
+
 void updateButtons()
 {
-    static bool lastInspect = HIGH;
-    static bool lastMode = HIGH;
-    static bool lastPower = HIGH;
+    processButton(
+        INSPECT_BUTTON,
+        inspectButton);
 
-    bool inspect = digitalRead(INSPECT_BUTTON);
-    bool mode = digitalRead(MODE_BUTTON);
-    bool power = digitalRead(POWER_BUTTON);
+    processButton(
+        MODE_BUTTON,
+        modeButton);
 
-    if(lastInspect == HIGH && inspect == LOW)
-        inspectFlag = true;
-
-    if(lastMode == HIGH && mode == LOW)
-        modeFlag = true;
-
-    if(lastPower == HIGH && power == LOW)
-        powerFlag = true;
-
-    lastInspect = inspect;
-    lastMode = mode;
-    lastPower = power;
-}
-
-bool inspectPressed()
-{
-    if(inspectFlag)
-    {
-        inspectFlag = false;
-        return true;
-    }
-
-    return false;
-}
-
-bool modePressed()
-{
-    if(modeFlag)
-    {
-        modeFlag = false;
-        return true;
-    }
-
-    return false;
-}
-
-bool powerPressed()
-{
-    if(powerFlag)
-    {
-        powerFlag = false;
-        return true;
-    }
-
-    return false;
+    processButton(
+        POWER_BUTTON,
+        powerButton);
 }

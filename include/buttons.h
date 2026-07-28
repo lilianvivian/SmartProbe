@@ -1,14 +1,8 @@
-#ifndef BUTTONS_H
-#define BUTTONS_H
+#pragma once
+
+#include <Arduino.h>
+
 
 void initButtons();
-
 void updateButtons();
 
-bool inspectPressed();
-
-bool modePressed();
-
-bool powerPressed();
-
-#endif

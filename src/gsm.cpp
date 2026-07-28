@@ -1,24 +1,31 @@
 #include "gsm.h"
 
+
 HardwareSerial sim800(1);
 
 // Current pin allocation
-#define GSM_TX_PIN 9     // ESP32 TX -> SIM RX
-#define GSM_RX_PIN 10    // ESP32 RX <- SIM TX
+#define GSM_TX_PIN 1  // ESP32 TX -> SIM RX
+#define GSM_RX_PIN 2  // ESP32 RX <- SIM TX
 
 //--------------------------------------------------
 // Send Command
 //--------------------------------------------------
 
-String sendCommand(String command, uint32_t timeout = 2000)
+String sendCommand(String command, uint32_t timeout)
 {
     while (sim800.available())
+    {
         sim800.read();
+    }
+
+    Serial.print(">> ");
+    Serial.println(command);
 
     sim800.println(command);
 
-    uint32_t start = millis();
     String response = "";
+
+    unsigned long start = millis();
 
     while (millis() - start < timeout)
     {
@@ -26,7 +33,18 @@ String sendCommand(String command, uint32_t timeout = 2000)
         {
             response += (char)sim800.read();
         }
+
+        if (response.indexOf("OK") >= 0 ||
+            response.indexOf("ERROR") >= 0)
+        {
+            break;
+        }
+
+        delay(5);
     }
+
+    Serial.print("<< ");
+    Serial.println(response);
 
     return response;
 }
@@ -37,17 +55,26 @@ String sendCommand(String command, uint32_t timeout = 2000)
 
 void initGSM()
 {
-    sim800.begin(9600, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
+    Serial.println("Initializing SIM800L...");
 
-    delay(2000);
+    sim800.begin(115200, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
 
-    sendCommand("AT");
+    delay(3000);
 
-    sendCommand("ATE0");
+    while (sim800.available())
+        sim800.read();
 
-    sendCommand("AT+CMGF=1");
+    sim800.println("AT");
+
+    delay(1000);
+
+    while (sim800.available())
+    {
+        Serial.write(sim800.read());
+    }
+
+    Serial.println("Finished GSM test.");
 }
-
 //--------------------------------------------------
 // Check Module
 //--------------------------------------------------
@@ -56,7 +83,7 @@ bool checkModule()
 {
     String response = sendCommand("AT");
 
-    return response.indexOf("OK") >= 0;
+    return response.indexOf("OK") != -1;
 }
 
 //--------------------------------------------------
