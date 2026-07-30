@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include "buzzer.h"
-
-#define BUZZER_PIN 18
+#include "pins.h"
 
 bool buzzerState = false;
 unsigned long buzzerPreviousMillis = 0;

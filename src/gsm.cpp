@@ -1,13 +1,14 @@
 #include "gsm.h"
+#include "pins.h"
 
 HardwareSerial sim800(2);
-
-#define GSM_RX 16
-#define GSM_TX 17
 
 //--------------------------------------------------
 
 static bool moduleReady = false;
+
+static const unsigned long REGISTRATION_TIMEOUT = 30000;
+static const int AT_ATTEMPTS = 5;
 
 //--------------------------------------------------
 
@@ -53,6 +54,23 @@ static String sendCommand(String cmd, unsigned long timeout)
     return readResponse(timeout);
 }
 
+//--------------------------------------------------
+
+// The SIM800 has its own supply and does not reset when the ESP32 does, so it
+// can still be sitting at the SMS ">" prompt from a previous run. ESC + Ctrl-Z
+// aborts that prompt; without it the modem swallows "AT" as message text and
+// never answers OK.
+static void abortPendingPrompt()
+{
+    sim800.write(27);
+
+    delay(500);
+
+    sim800.write(26);
+
+    delay(1000);
+}
+
 void initGSM()
 {
     Serial.println();
@@ -60,22 +78,37 @@ void initGSM()
     Serial.println(" SMART PROBE GSM INITIALIZATION");
     Serial.println("================================");
 
-    sim800.begin(9600, SERIAL_8N1, GSM_RX, GSM_TX);
+    sim800.begin(9600, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
 
     delay(8000);
 
-    String response = sendCommand("AT",1500);
+    abortPendingPrompt();
 
-    if(response.indexOf("OK") == -1)
+    moduleReady = false;
+
+    for(int attempt = 1; attempt <= AT_ATTEMPTS; attempt++)
+    {
+        Serial.print("AT attempt ");
+        Serial.print(attempt);
+        Serial.print(" of ");
+        Serial.println(AT_ATTEMPTS);
+
+        if(sendCommand("AT",1500).indexOf("OK") != -1)
+        {
+            moduleReady = true;
+
+            break;
+        }
+
+        delay(1000);
+    }
+
+    if(!moduleReady)
     {
         Serial.println("GSM NOT DETECTED!");
 
-        moduleReady = false;
-
         return;
     }
-
-    moduleReady = true;
 
     sendCommand("AT+CMEE=2",1500);
 
@@ -108,6 +141,27 @@ bool gsmRegistered()
 
     return response.indexOf("+CREG: 0,1")!=-1 ||
            response.indexOf("+CREG: 0,5")!=-1;
+}
+
+//--------------------------------------------------
+
+// A SIM800 normally needs 10-30s to attach after power-up, so a single query
+// is not enough to conclude the network is unavailable.
+static bool waitForRegistration(unsigned long timeout)
+{
+    unsigned long start = millis();
+
+    while(millis() - start < timeout)
+    {
+        if(gsmRegistered())
+            return true;
+
+        Serial.println("Waiting for network registration...");
+
+        delay(2000);
+    }
+
+    return false;
 }
 
 int getSignalStrength()
@@ -150,7 +204,7 @@ bool sendSMS(const String &number,const String &message)
         return false;
     }
 
-    if(!gsmRegistered())
+    if(!waitForRegistration(REGISTRATION_TIMEOUT))
     {
         Serial.println("Network unavailable.");
 
@@ -169,6 +223,8 @@ bool sendSMS(const String &number,const String &message)
     {
         Serial.println("CMGS failed.");
 
+        abortPendingPrompt();
+
         return false;
     }
 
@@ -186,6 +242,8 @@ bool sendSMS(const String &number,const String &message)
     }
 
     Serial.println("SMS FAILED");
+
+    abortPendingPrompt();
 
     return false;
 }

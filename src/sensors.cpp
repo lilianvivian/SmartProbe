@@ -1,12 +1,11 @@
 #include <Arduino.h>
 #include <DHT.h>
 #include "sensors.h"
+#include "pins.h"
 
-#define DHTPIN 4
 #define DHTTYPE DHT11
-#define MQ2_PIN 6
 
-DHT dht(DHTPIN, DHTTYPE);
+DHT dht(DHT_PIN, DHTTYPE);
 int mq2Pin = MQ2_PIN;
 
 void initSensors()

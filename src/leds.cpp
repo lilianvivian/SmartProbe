@@ -1,9 +1,6 @@
 #include <Arduino.h>
 #include "leds.h"
-
-#define GREEN_LED   15
-#define YELLOW_LED  16
-#define RED_LED     17
+#include "pins.h"
 
 void initLEDs()
 {
