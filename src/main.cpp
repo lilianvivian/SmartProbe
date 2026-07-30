@@ -29,7 +29,7 @@ typedef struct __attribute__((packed)) {
     float accelY;
     float accelZ;
     float laserDistance; 
-    int adc35Value;      
+    int batteryPct;      
 
     bool dhtAlive;     
     bool mpuAlive;
@@ -47,8 +47,6 @@ typedef struct __attribute__((packed)) {
 #define PIN_SERVO    32
 #define PIN_ADC_35   35
 
-// --- Servo Configuration Parameters ---
-const int STEP_DELAY_MS = 400; // Match your 400ms target update delay
 
 // Functional Hardware Connection State Variables
 bool isDhtReady  = false;
@@ -59,6 +57,9 @@ bool isTofReady  = false;
 // Targeted Remote Hardware Node Mac Addresses
 uint8_t macA[] = {0xec, 0x62, 0x60, 0xa7, 0x1b, 0xe8};
 uint8_t macC[] = {0x08, 0xa6, 0xf7, 0x12, 0x7f, 0x38};
+
+volatile bool btnStateMode = false;
+volatile int targetServoAngle = 90;
 
 // Instantiate Objects
 Adafruit_MPU6050 mpu;
@@ -75,6 +76,13 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *incomingDataBytes, int len) {
     if (len == sizeof(tx_message_t)) {
         tx_message_t receivedJoystick;
         memcpy(&receivedJoystick, incomingDataBytes, sizeof(tx_message_t));
+
+        btnStateMode = receivedJoystick.btnState;
+        if(btnStateMode){
+            targetServoAngle = map(receivedJoystick.joyX, 0, 4095, 10, 170);
+            targetServoAngle = constrain(targetServoAngle, 10, 170);
+        }
+
         xQueueSendFromISR(relayQueue, &receivedJoystick, NULL);
     }
 }
@@ -97,6 +105,11 @@ void vTaskRelay(void *pvParameters) {
 void vTaskSensors(void *pvParameters) {
     rx_message_t telemetry;
     TickType_t xLastWakeTime = xTaskGetTickCount();
+
+    const float DIVIDER_RATIO = (47000.0f + 10000.0f) / 10000.0f; 
+    const float ESP32_REF_VOLTS = 3.3f;                           
+    const float BATT_MAX_VOLTS = 16.0f; const float BATT_MIN_VOLTS = 14.0f;
+    
     const TickType_t xFrequency = pdMS_TO_TICKS(500); 
 
     for (;;) {
@@ -141,7 +154,12 @@ void vTaskSensors(void *pvParameters) {
             telemetry.laserDistance = -1.0f;
         }
 
-        telemetry.adc35Value = analogRead(PIN_ADC_35);
+        
+        int rawADC35 = analogRead(PIN_ADC_35);
+        float pinVoltage = (rawADC35 / 4095.0f) * ESP32_REF_VOLTS;
+        float batteryVoltage = pinVoltage * DIVIDER_RATIO;
+        float pctFloat = ((batteryVoltage - BATT_MIN_VOLTS) / (BATT_MAX_VOLTS - BATT_MIN_VOLTS)) * 100.0f;
+        telemetry.batteryPct = constrain((int)pctFloat, 0, 100);
 
         esp_now_send(macA, (uint8_t *)&telemetry, sizeof(rx_message_t));
 
@@ -153,33 +171,20 @@ void vTaskSensors(void *pvParameters) {
 // --- Task 3: Non-Blocking Multi-Directional Radar Servo Sweep ---
 // ============================================================================
 void vTaskServo(void *pvParameters) {
-    int currentPos = 45;
-    bool sweepingForward = true;
+  
+    radarServo.write(90);
+    vTaskDelay(pdMS_TO_TICKS(700));
 
-    // Synchronize initial configuration parameters inside the task space safely
-    radarServo.write(currentPos);
-    vTaskDelay(pdMS_TO_TICKS(2000)); // Non-blocking startup stabilization window
-
-    for (;;) {
-        radarServo.write(currentPos);
-
-        // Direction mapping tracking matching your looping architecture
-        if (sweepingForward) {
-            currentPos += 5;
-            if (currentPos >= 80) {
-                sweepingForward = false; // Turn around down towards 10°
-            }
-        } else {
-            currentPos -= 5;
-            if (currentPos <= 10) {
-                sweepingForward = true;  // Turn around back up towards 80°
-            }
+    for(;;){
+        if(btnStateMode){
+            radarServo.write(targetServoAngle);
         }
+    }
 
         // Suspend task non-blockingly to yield cycle allocations
-        vTaskDelay(pdMS_TO_TICKS(STEP_DELAY_MS)); 
+        vTaskDelay(pdMS_TO_TICKS(20)); 
     }
-}
+
 
 // ============================================================================
 // --- Core System Setup ---
