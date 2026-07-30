@@ -7,7 +7,7 @@
 #include <Adafruit_Sensor.h>
 #include <VL53L1X.h>
 #include <DHT.h>
-#include <ESP32Servo.h> // Using the requested ESP32Servo Library
+#include <ESP32Servo.h> 
 
 // ============================================================================
 // --- FORWARD DECLARATION STRUCTURES (Placed at top to resolve compile scope) ---
@@ -47,6 +47,9 @@ typedef struct __attribute__((packed)) {
 #define PIN_SERVO    32
 #define PIN_ADC_35   35
 
+// Calibration Parameter Maps
+#define JOY_CENTER    1875
+#define JOY_DEADZONE  250  // Expanded deadzone to avoid center-stick drift
 
 // Functional Hardware Connection State Variables
 bool isDhtReady  = false;
@@ -58,15 +61,16 @@ bool isTofReady  = false;
 uint8_t macA[] = {0xec, 0x62, 0x60, 0xa7, 0x1b, 0xe8};
 uint8_t macC[] = {0x08, 0xa6, 0xf7, 0x12, 0x7f, 0x38};
 
+// Cross-Task Global Volatiles (Thread-Safe Syncing Flags)
 volatile bool btnStateMode = false;
-volatile int targetServoAngle = 90;
+volatile int targetServoAngle = 45; // Starts at requested 45° home angle position
 
 // Instantiate Objects
 Adafruit_MPU6050 mpu;
 Adafruit_BMP085  bmp; 
 VL53L1X          vl53;
 DHT              dht(PIN_DHT, DHT_TYPE);
-Servo            radarServo; // ESP32Servo Object Instance
+Servo            radarServo; 
 QueueHandle_t    relayQueue = NULL;
 
 // ============================================================================
@@ -78,9 +82,17 @@ void OnDataRecv(const uint8_t *mac, const uint8_t *incomingDataBytes, int len) {
         memcpy(&receivedJoystick, incomingDataBytes, sizeof(tx_message_t));
 
         btnStateMode = receivedJoystick.btnState;
-        if(btnStateMode){
-            targetServoAngle = map(receivedJoystick.joyX, 0, 4095, 10, 170);
-            targetServoAngle = constrain(targetServoAngle, 10, 170);
+        
+        // ENHANCEMENT: Only update the target angle if joystick is actively being pushed
+        if (btnStateMode) {
+            int xOffset = receivedJoystick.joyX - JOY_CENTER;
+            
+            if (abs(xOffset) > JOY_DEADZONE) {
+                // Read input and map it directly to structural servo angle bounds
+                targetServoAngle = map(receivedJoystick.joyX, 0, 4095, 10, 170);
+                targetServoAngle = constrain(targetServoAngle, 10, 170);
+            }
+            // If stick is in the deadzone, targetServoAngle remains untouched (Holds position)
         }
 
         xQueueSendFromISR(relayQueue, &receivedJoystick, NULL);
@@ -154,7 +166,6 @@ void vTaskSensors(void *pvParameters) {
             telemetry.laserDistance = -1.0f;
         }
 
-        
         int rawADC35 = analogRead(PIN_ADC_35);
         float pinVoltage = (rawADC35 / 4095.0f) * ESP32_REF_VOLTS;
         float batteryVoltage = pinVoltage * DIVIDER_RATIO;
@@ -168,23 +179,37 @@ void vTaskSensors(void *pvParameters) {
 }
 
 // ============================================================================
-// --- Task 3: Non-Blocking Multi-Directional Radar Servo Sweep ---
+// --- Task 3: Smooth Slew-Rate Limited MG995 Position Controller ---
 // ============================================================================
 void vTaskServo(void *pvParameters) {
-  
-    radarServo.write(90);
-    vTaskDelay(pdMS_TO_TICKS(700));
+    int currentAngle = 45; // Initialize at target home angle
+    radarServo.write(currentAngle);
+    vTaskDelay(pdMS_TO_TICKS(1000));
 
-    for(;;){
-        if(btnStateMode){
-            radarServo.write(targetServoAngle);
+    for (;;) {
+        if (btnStateMode) {
+            // MODE 2: Manual Gimbal Tracking Mode
+            int error = targetServoAngle - currentAngle;
+            
+            if (abs(error) > 0) {
+                // Slew-rate step tracking: limit changes to 2 degrees per 20ms to make it track smoothly
+                int step = constrain(error, -2, 2); 
+                currentAngle += step;
+                radarServo.write(currentAngle);
+            }
+        } else {
+            // MODE 1: Return smoothly to 45° park position ONLY when switched back to motor control mode
+            if (currentAngle != 45) {
+                int error = 45 - currentAngle;
+                int step = constrain(error, -2, 2);
+                currentAngle += step;
+                radarServo.write(currentAngle);
+            }
         }
-    }
 
-        // Suspend task non-blockingly to yield cycle allocations
         vTaskDelay(pdMS_TO_TICKS(20)); 
     }
-
+}
 
 // ============================================================================
 // --- Core System Setup ---
@@ -192,54 +217,26 @@ void vTaskServo(void *pvParameters) {
 void setup() {
     Serial.begin(115200);
 
-    // Initialise Shared I2C Control Infrastructure 
     Wire.begin(I2C_SDA, I2C_SCL, 100000);
-
     Serial.println("\n=== Initializing GY-87 & Shared Hardware Array ===");
 
-    // [Safety Wrapper 1]: DHT Check
     dht.begin();
-    if (!isnan(dht.readTemperature())) {
-        isDhtReady = true;
-        Serial.println("[OK] DHT22 Operational.");
-    } else {
-        Serial.println("[FAIL] DHT22 Connection Timed Out.");
-    }
-
-    // [Safety Wrapper 2]: GY-87 MPU6050 Check
-    if (mpu.begin(0x68, &Wire)) {
-        isMpuReady = true;
-        Serial.println("[OK] GY-87 IMU (MPU6050) Connected.");
-    } else {
-        Serial.println("[FAIL] GY-87 IMU (MPU6050) Missing.");
-    }
-
-    // [Safety Wrapper 3]: GY-87 BMP180 Check
-    if (bmp.begin()) {
-        isBaroReady = true;
-        Serial.println("[OK] GY-87 Barometer (BMP180) Connected.");
-    } else {
-        Serial.println("[FAIL] GY-87 Barometer (BMP180) Missing.");
-    }
-
-    // [Safety Wrapper 4]: VL53L1X Check
+    if (!isnan(dht.readTemperature())) isDhtReady = true;
+    if (mpu.begin(0x68, &Wire)) isMpuReady = true;
+    if (bmp.begin()) isBaroReady = true;
+    
     vl53.setTimeout(200);
     if (vl53.init()) {
         isTofReady = true;
         vl53.setDistanceMode(VL53L1X::Long);
         vl53.setMeasurementTimingBudget(40000);
         vl53.startContinuous(50);
-        Serial.println("[OK] VL53L1X TOF Distance Module Active.");
-    } else {
-        Serial.println("[FAIL] VL53L1X TOF Module Offline.");
     }
-    Serial.println("=============================================\n");
+    Serial.println("=================================================");
 
-    // Initialize ESP32Servo properties safely outside loop structure
     radarServo.setPeriodHertz(50);
     radarServo.attach(PIN_SERVO, 500, 2500);
 
-    // Boot Up Networking Hardware Layer
     WiFi.mode(WIFI_STA);
     if (esp_now_init() != ESP_OK) return;
 
@@ -254,7 +251,6 @@ void setup() {
 
     relayQueue = xQueueCreate(10, sizeof(tx_message_t));
 
-    // Spawn Multithread Processing Allocations across Core 1
     xTaskCreatePinnedToCore(vTaskRelay, "RelayEngine", 4096, NULL, 3, NULL, 1);
     xTaskCreatePinnedToCore(vTaskSensors, "SensorEngine", 4096, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(vTaskServo, "ServoDriver", 2048, NULL, 1, NULL, 1);
@@ -263,5 +259,3 @@ void setup() {
 void loop() {
     vTaskDelete(NULL); 
 }
-
-
