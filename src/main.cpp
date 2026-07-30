@@ -1,32 +1,17 @@
 #include <Arduino.h>
 #include <esp_now.h>
 #include <WiFi.h>
-#include <math.h>
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_BMP085.h>
+#include <Adafruit_Sensor.h>
+#include <VL53L1X.h>
+#include <DHT.h>
+#include <ESP32Servo.h> // Using the requested ESP32Servo Library
 
-// --- Pin Configurations ---
-#define PIN_VRX 34  // X-Axis Analog Input
-#define PIN_VRY 35  // Y-Axis Analog Input
-#define PIN_SW  27  // Pushbutton Switch (Requires Pull-up)
-#define PIN_LED 2   // Onboard / External Feedback LED (PWM output)
-
-// --- PWM Configurations ---
-#define PWM_FREQ     5000
-#define PWM_CHAN     0
-#define PWM_RES      8  // 8-bit resolution (0-255)
-
-// --- Joystick Calibration Defaults ---
-#define JOY_CENTER 1875  
-#define JOY_DEADZONE 150 
-
-// Target Node B (Hub) MAC Address
-uint8_t macB[] = {0x68, 0x09, 0x47, 0x5d, 0x14, 0xbc};
-
-// --- Global Buffer for Real-time Local Control Values ---
-// Declared volatile to ensure thread-safe cross-task memory reads
-volatile int currentLocalJoyX = JOY_CENTER;
-volatile int currentLocalJoyY = JOY_CENTER;
-
-// --- Strict Network Packet Definitions (Packed for 0-Byte Structure Padding) ---
+// ============================================================================
+// --- FORWARD DECLARATION STRUCTURES (Placed at top to resolve compile scope) ---
+// ============================================================================
 typedef struct __attribute__((packed)) {
     int id;           // 1 for Node A
     int joyX;         
@@ -36,148 +21,242 @@ typedef struct __attribute__((packed)) {
 } tx_message_t;
 
 typedef struct __attribute__((packed)) {
-    // Atmospheric & Multi-Sensor Telemetry Block
-    float temperature;   // Read from DHT22 or BMP180
-    float humidity;      // Read from DHT22
-    float pressurePa;    // Barometric Pressure (Pascals) from GY-87 (BMP180)
-    float baroAltitude;  // Estimated Altitude (Meters) calculated from pressure
-    float accelX;        // Motion readings from GY-87 (MPU6050)
+    float temperature;   
+    float humidity;      
+    float pressurePa;    
+    float baroAltitude;  
+    float accelX;        
     float accelY;
     float accelZ;
-    float laserDistance; // Ranging distance (cm) from independent VL53L1X module
-    int batteryPct;      // Remote battery metrics mapped from 14V-16V window
+    float laserDistance; 
+    int adc35Value;      
 
-    // Component-Specific Hardware Connection Flags
     bool dhtAlive;     
     bool mpuAlive;
     bool baroAlive;
     bool tofAlive;
 } rx_message_t;
 
-// --- FreeRTOS Queue Handles ---
-QueueHandle_t rxQueue = NULL;
+// ============================================================================
+// --- Hardware Pin Layout Configurations ---
+// ============================================================================
+#define PIN_DHT      17
+#define DHT_TYPE     DHT22  
+#define I2C_SDA      21
+#define I2C_SCL      16
+#define PIN_SERVO    32
+#define PIN_ADC_35   35
 
-// --- ESP-NOW Callbacks ---
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {}
+// --- Servo Configuration Parameters ---
+const int STEP_DELAY_MS = 400; // Match your 400ms target update delay
 
+// Functional Hardware Connection State Variables
+bool isDhtReady  = false;
+bool isMpuReady  = false;
+bool isBaroReady = false;
+bool isTofReady  = false;
+
+// Targeted Remote Hardware Node Mac Addresses
+uint8_t macA[] = {0xec, 0x62, 0x60, 0xa7, 0x1b, 0xe8};
+uint8_t macC[] = {0x08, 0xa6, 0xf7, 0x12, 0x7f, 0x38};
+
+// Instantiate Objects
+Adafruit_MPU6050 mpu;
+Adafruit_BMP085  bmp; 
+VL53L1X          vl53;
+DHT              dht(PIN_DHT, DHT_TYPE);
+Servo            radarServo; // ESP32Servo Object Instance
+QueueHandle_t    relayQueue = NULL;
+
+// ============================================================================
+// --- Network Data Intercept Hook ---
+// ============================================================================
 void OnDataRecv(const uint8_t *mac, const uint8_t *incomingDataBytes, int len) {
-    rx_message_t incomingPacket;
-    if (len == sizeof(rx_message_t)) {
-        memcpy(&incomingPacket, incomingDataBytes, sizeof(rx_message_t));
-        xQueueSendFromISR(rxQueue, &incomingPacket, NULL);
+    if (len == sizeof(tx_message_t)) {
+        tx_message_t receivedJoystick;
+        memcpy(&receivedJoystick, incomingDataBytes, sizeof(tx_message_t));
+        xQueueSendFromISR(relayQueue, &receivedJoystick, NULL);
     }
 }
 
-// --- Task 1: Non-Delay Continuous Controller Sampling & Transmission ---
-void vTaskSender(void *pvParameters) {
-    tx_message_t txData;
-    txData.id = 1;
-    
+// ============================================================================
+// --- Task 1: Continuous Input Relay Interface (Node B -> Node C) ---
+// ============================================================================
+void vTaskRelay(void *pvParameters) {
+    tx_message_t joystickData;
+    for (;;) {
+        if (xQueueReceive(relayQueue, &joystickData, portMAX_DELAY) == pdPASS) {
+            esp_now_send(macC, (uint8_t *)&joystickData, sizeof(tx_message_t));
+        }
+    }
+}
+
+// ============================================================================
+// --- Task 2: Advanced Telemetry Mapping (Node B -> Node A Return Path) ---
+// ============================================================================
+void vTaskSensors(void *pvParameters) {
+    rx_message_t telemetry;
     TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(50); // Continuous 50ms stream
+    const TickType_t xFrequency = pdMS_TO_TICKS(500); 
 
     for (;;) {
-        int rawX = analogRead(PIN_VRX);
-        int rawY = analogRead(PIN_VRY);
-        bool rawSW = !digitalRead(PIN_SW);
+        telemetry.dhtAlive  = isDhtReady;
+        telemetry.mpuAlive  = isMpuReady;
+        telemetry.baroAlive = isBaroReady;
+        telemetry.tofAlive  = isTofReady;
 
-        // Invert axes to correct physical steering and driving mapping profiles
-        int invertedY = 4095 - rawY; 
-        int invertedX = 4095 - rawX; 
-
-        // Update tracking channels for the logger console thread safely
-        currentLocalJoyX = invertedX;
-        currentLocalJoyY = invertedY;
-
-        long deltaX = invertedX - JOY_CENTER;
-        long deltaY = invertedY - JOY_CENTER;
-        double distanceVec = sqrt((deltaX * deltaX) + (deltaY * deltaY));
-
-        int ledBrightness = 0;
-        if (distanceVec > JOY_DEADZONE) {
-            ledBrightness = map(distanceVec, JOY_DEADZONE, 2000, 0, 255);
-            ledBrightness = constrain(ledBrightness, 0, 255);
+        if (isDhtReady) {
+            float h = dht.readHumidity();
+            float t = dht.readTemperature();
+            telemetry.humidity = isnan(h) ? 0.0f : h;
+            telemetry.temperature = isnan(t) ? 0.0f : t;
+        } else {
+            telemetry.humidity = 0.0f; telemetry.temperature = 0.0f;
         }
 
-        ledcWrite(PWM_CHAN, ledBrightness);
+        if (isMpuReady) {
+            sensors_event_t a, g, temp;
+            mpu.getEvent(&a, &g, &temp);
+            telemetry.accelX = a.acceleration.x;
+            telemetry.accelY = a.acceleration.y;
+            telemetry.accelZ = a.acceleration.z;
+        } else {
+            telemetry.accelX = 0.0f; telemetry.accelY = 0.0f; telemetry.accelZ = 0.0f;
+        }
 
-        txData.joyX = invertedX;
-        txData.joyY = invertedY; 
-        txData.btnState = rawSW;
-        txData.intensity = ledBrightness;
+        if (isBaroReady) {
+            telemetry.pressurePa = (float)bmp.readPressure();
+            telemetry.baroAltitude = bmp.readAltitude(101325); 
+            if (!isDhtReady) { 
+                telemetry.temperature = bmp.readTemperature(); 
+            }
+        } else {
+            telemetry.pressurePa = 0.0f; telemetry.baroAltitude = 0.0f;
+        }
 
-        esp_now_send(macB, (uint8_t *)&txData, sizeof(tx_message_t));
+        if (isTofReady) {
+            uint16_t distMm = vl53.read();
+            telemetry.laserDistance = (distMm == 65535) ? -1.0f : (float)distMm / 10.0f;
+        } else {
+            telemetry.laserDistance = -1.0f;
+        }
+
+        telemetry.adc35Value = analogRead(PIN_ADC_35);
+
+        esp_now_send(macA, (uint8_t *)&telemetry, sizeof(rx_message_t));
 
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
     }
 }
 
-// --- Task 2: Advanced Telemetry Queue Processing & Integrated CSV Output ---
-void vTaskReceiver(void *pvParameters) {
-    rx_message_t rxData;
+// ============================================================================
+// --- Task 3: Non-Blocking Multi-Directional Radar Servo Sweep ---
+// ============================================================================
+void vTaskServo(void *pvParameters) {
+    int currentPos = 45;
+    bool sweepingForward = true;
 
-    // UPDATED CSV HEADER: Added local_joy_x and local_joy_y right after the timestamp
-    Serial.println("\ntimestamp_ms,local_joy_x,local_joy_y,dht_ok,mpu_ok,bmp_ok,tof_ok,temp_c,humidity_pct,pressure_pa,altitude_m,accel_x,accel_y,accel_z,laser_dist_cm,battery_pct");
+    // Synchronize initial configuration parameters inside the task space safely
+    radarServo.write(currentPos);
+    vTaskDelay(pdMS_TO_TICKS(2000)); // Non-blocking startup stabilization window
 
     for (;;) {
-        if (xQueueReceive(rxQueue, &rxData, portMAX_DELAY) == pdPASS) {
-            
-            // Print clean row combining live local controller sticks and incoming telemetry
-            Serial.printf("%lu,%d,%d,%d,%d,%d,%d,%.2f,%.2f,%.1f,%.2f,%.3f,%.3f,%.3f,%.2f,%d\n",
-                          millis(),
-                          currentLocalJoyX, // Integrated Analog Parameters
-                          currentLocalJoyY,
-                          rxData.dhtAlive  ? 1 : 0,
-                          rxData.mpuAlive  ? 1 : 0,
-                          rxData.baroAlive ? 1 : 0,
-                          rxData.tofAlive  ? 1 : 0,
-                          rxData.temperature,
-                          rxData.humidity,
-                          rxData.pressurePa,
-                          rxData.baroAltitude,
-                          rxData.accelX,
-                          rxData.accelY,
-                          rxData.accelZ,
-                          rxData.laserDistance,
-                          rxData.batteryPct);
+        radarServo.write(currentPos);
+
+        // Direction mapping tracking matching your looping architecture
+        if (sweepingForward) {
+            currentPos += 5;
+            if (currentPos >= 80) {
+                sweepingForward = false; // Turn around down towards 10°
+            }
+        } else {
+            currentPos -= 5;
+            if (currentPos <= 10) {
+                sweepingForward = true;  // Turn around back up towards 80°
+            }
         }
+
+        // Suspend task non-blockingly to yield cycle allocations
+        vTaskDelay(pdMS_TO_TICKS(STEP_DELAY_MS)); 
     }
 }
 
+// ============================================================================
+// --- Core System Setup ---
+// ============================================================================
 void setup() {
     Serial.begin(115200);
 
-    pinMode(PIN_SW, INPUT_PULLUP);
-    ledcSetup(PWM_CHAN, PWM_FREQ, PWM_RES);
-    ledcAttachPin(PIN_LED, PWM_CHAN);
+    // Initialise Shared I2C Control Infrastructure 
+    Wire.begin(I2C_SDA, I2C_SCL, 100000);
 
-    WiFi.mode(WIFI_STA);
+    Serial.println("\n=== Initializing GY-87 & Shared Hardware Array ===");
 
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("Fatal Error: ESP-NOW Architecture Failed to Init.");
-        return;
+    // [Safety Wrapper 1]: DHT Check
+    dht.begin();
+    if (!isnan(dht.readTemperature())) {
+        isDhtReady = true;
+        Serial.println("[OK] DHT22 Operational.");
+    } else {
+        Serial.println("[FAIL] DHT22 Connection Timed Out.");
     }
 
-    esp_now_register_send_cb(OnDataSent);
+    // [Safety Wrapper 2]: GY-87 MPU6050 Check
+    if (mpu.begin(0x68, &Wire)) {
+        isMpuReady = true;
+        Serial.println("[OK] GY-87 IMU (MPU6050) Connected.");
+    } else {
+        Serial.println("[FAIL] GY-87 IMU (MPU6050) Missing.");
+    }
+
+    // [Safety Wrapper 3]: GY-87 BMP180 Check
+    if (bmp.begin()) {
+        isBaroReady = true;
+        Serial.println("[OK] GY-87 Barometer (BMP180) Connected.");
+    } else {
+        Serial.println("[FAIL] GY-87 Barometer (BMP180) Missing.");
+    }
+
+    // [Safety Wrapper 4]: VL53L1X Check
+    vl53.setTimeout(200);
+    if (vl53.init()) {
+        isTofReady = true;
+        vl53.setDistanceMode(VL53L1X::Long);
+        vl53.setMeasurementTimingBudget(40000);
+        vl53.startContinuous(50);
+        Serial.println("[OK] VL53L1X TOF Distance Module Active.");
+    } else {
+        Serial.println("[FAIL] VL53L1X TOF Module Offline.");
+    }
+    Serial.println("=============================================\n");
+
+    // Initialize ESP32Servo properties safely outside loop structure
+    radarServo.setPeriodHertz(50);
+    radarServo.attach(PIN_SERVO, 500, 2500);
+
+    // Boot Up Networking Hardware Layer
+    WiFi.mode(WIFI_STA);
+    if (esp_now_init() != ESP_OK) return;
+
     esp_now_register_recv_cb(OnDataRecv);
 
     esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, macB, 6);
     peerInfo.channel = 0;
     peerInfo.encrypt = false;
     
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-        Serial.println("Fatal Error: Failed to add Node B peer structure map.");
-        return;
-    }
+    memcpy(peerInfo.peer_addr, macA, 6); esp_now_add_peer(&peerInfo);
+    memcpy(peerInfo.peer_addr, macC, 6); esp_now_add_peer(&peerInfo);
 
-    rxQueue = xQueueCreate(5, sizeof(rx_message_t));
-    if (rxQueue == NULL) return;
+    relayQueue = xQueueCreate(10, sizeof(tx_message_t));
 
-    xTaskCreatePinnedToCore(vTaskSender, "JoystickSender", 3072, NULL, 2, NULL, 1);
-    xTaskCreatePinnedToCore(vTaskReceiver, "ConsoleReceiver", 4096, NULL, 1, NULL, 1);
+    // Spawn Multithread Processing Allocations across Core 1
+    xTaskCreatePinnedToCore(vTaskRelay, "RelayEngine", 4096, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(vTaskSensors, "SensorEngine", 4096, NULL, 2, NULL, 1);
+    xTaskCreatePinnedToCore(vTaskServo, "ServoDriver", 2048, NULL, 1, NULL, 1);
 }
 
 void loop() {
     vTaskDelete(NULL); 
 }
+
+
