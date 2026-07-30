@@ -1,11 +1,9 @@
 #include <Arduino.h>
 #include "commands.h"
 #include "systemreport.h"
+#include "config.h"
 
-//--------------------------------------------------
-// Smart Probe Configuration
-//--------------------------------------------------
-const String PROBE_ID = "SP001";
+// PROBE_ID is defined once in communication.cpp (declared extern in config.h).
 
 //--------------------------------------------------
 // Process Incoming Command

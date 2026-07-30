@@ -16,6 +16,7 @@
 #include "events.h"
 #include "devicestate.h"
 #include "operatingmode.h"
+#include "telemetry.h"
 #include "config.h"
 
 static bool criticalAlertSent = false;
@@ -235,6 +236,11 @@ if(report.guardian.status != CRITICAL)
         statusToString(report.guardian.status),
         trendToLCDString(report.prediction.trend),
         report.prediction.nextInspectionDays);
+
+    //--------------------------------------------------
+    // Telemetry (both AUTO and OVERRIDE modes)
+    //--------------------------------------------------
+    publishReport(report);
 
     //--------------------------------------------------
     // Outputs
