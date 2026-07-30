@@ -4,13 +4,14 @@
 #include <Arduino.h>
 
 void initGSM();
+void updateGSM();
 
-bool sendSMS(String phoneNumber, String message);
+bool gsmReady();
+bool gsmRegistered();
 
-bool checkModule();
+bool sendSMS(const String &number, const String &message);
 
-void processGSM();
-
-String sendCommand(String command, uint32_t timeout= 2000);
+int getSignalStrength();
+String getOperator();
 
 #endif

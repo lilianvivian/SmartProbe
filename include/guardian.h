@@ -32,6 +32,8 @@ struct GuardianDecision
     bool yellowLed;
     bool redLed;
 
+    bool sendSMS;
+
     const char* recommendation;
 };
 

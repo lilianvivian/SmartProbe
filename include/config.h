@@ -7,4 +7,4 @@
 #define VOC_WARNING        40
 #define VOC_CRITICAL       80
 
-#define SMS_PHONE_NUMBER   "+2547XXXXXXXX"
+const char* const FARMER_PHONE = "+254765156670";

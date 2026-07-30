@@ -44,16 +44,7 @@ void setup()
 
     updateProgress("GSM Module");
 
-if(checkModule())
-{
-    Serial.println("GSM Ready");
-}
-else
-{
-    Serial.println("GSM Not Detected");
-}
-
-delay(300);
+    delay(300);
 
     showReady();
 }

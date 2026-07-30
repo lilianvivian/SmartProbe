@@ -16,6 +16,11 @@
 #include "events.h"
 #include "devicestate.h"
 #include "operatingmode.h"
+#include "config.h"
+
+static bool criticalAlertSent = false;
+static unsigned long lastSMSAttempt = 0;
+const unsigned long smsRetryInterval = 60000; // 1 minute
 
 // Automatic inspection timer
 static unsigned long lastInspection = 0;
@@ -166,6 +171,50 @@ void performInspection()
         report.temperature,
         report.humidity,
         report.voc);
+
+    //--------------------------------------------------
+// GSM Alert
+//--------------------------------------------------
+if (report.guardian.sendSMS && !criticalAlertSent && millis() - lastSMSAttempt >= smsRetryInterval)
+{
+    lastSMSAttempt = millis();
+
+    String message;
+
+    message += "SMART PROBE ALERT\n\n";
+
+    message += "Critical grain storage conditions detected.\n\n";
+
+    message += "Temperature: ";
+    message += String(report.temperature, 1);
+    message += " C\n";
+
+    message += "Humidity: ";
+    message += String(report.humidity, 1);
+    message += " %\n";
+
+    message += "VOC: ";
+    message += String(report.voc, 1);
+    message += "\n\n";
+
+    message += "Recommendation: ";
+    message += report.guardian.recommendation;
+
+    if(sendSMS(FARMER_PHONE, message))
+    {
+        Serial.println("Critical SMS sent.");
+        criticalAlertSent = true;
+    }
+    else
+    {
+        Serial.println("SMS sending failed.");
+    }
+}
+
+if(report.guardian.status != CRITICAL)
+{
+    criticalAlertSent = false;
+}
 
     //--------------------------------------------------
     // TinyML

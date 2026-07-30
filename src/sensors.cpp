@@ -62,7 +62,7 @@ long total = 0;
 
 const char* gasLevel(float voc)
 {
-    if (voc < 220)
+    if (voc < 250)
         return "LOW";
 
     else if (voc < 400)

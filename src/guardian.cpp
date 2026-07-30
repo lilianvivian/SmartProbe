@@ -136,6 +136,9 @@ else
     // Alarm Recommendation
     decision.soundAlarm = (decision.status == CRITICAL);
 
+    // SMS Recommendation
+    decision.sendSMS = (decision.status == CRITICAL);
+
     //--------------------------------------------------
     // LED Recommendations
     //--------------------------------------------------
@@ -196,3 +199,4 @@ const char* causeToString(GrainCause cause)
             return "NONE";
     }
 }
+
