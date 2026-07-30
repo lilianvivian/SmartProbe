@@ -1,10 +1,12 @@
 #include <Arduino.h>
 #include "communication.h"
 #include "commands.h"
+#include "config.h"
 
 //--------------------------------------------------
 // Smart Probe Identification
 //--------------------------------------------------
+// Single definition for the whole firmware (declared extern in config.h).
 const String PROBE_ID = "SP001";
 
 //--------------------------------------------------

@@ -11,6 +11,7 @@
 #include "fan.h"
 #include "gsm.h"
 #include "buttons.h"
+#include "telemetry.h"
 
 void setup()
 {
@@ -21,6 +22,7 @@ void setup()
     initLEDs();
     initBuzzer();
     initCommunication();
+    initTelemetry();
     initGSM();
     initFan();
     initButtons();
@@ -42,6 +44,9 @@ void setup()
     updateProgress("AI Engine");
     delay(300);
 
+    updateProgress("WiFi");
+    delay(300);
+
     updateProgress("GSM Module");
 
     delay(300);
@@ -53,6 +58,7 @@ void loop()
 {
     updateSystem();
     updateButtons();
+    updateTelemetry();
 
     delay(1000);
 }
