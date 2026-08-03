@@ -24,7 +24,7 @@
 
 // Fan
 // Not wired yet. -1 keeps it off DHT_PIN; fan.cpp no-ops until a pin is set.
-#define FAN_PIN -1
+#define FAN_PIN 42
 
 // Pump
 // Not wired yet - no code drives this.
