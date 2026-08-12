@@ -37,7 +37,7 @@
 // Alarm Thresholds & GSM Target
 #define TEMP_THRESHOLD      32.0f  // °C
 #define HUM_THRESHOLD       65.0f  // %
-#define VOC_THRESHOLD       40     // Raw ADC
+#define VOC_THRESHOLD       1200    // Raw ADC
 #define TARGET_PHONE_NUM    "+254702808564"
 
 // Wi-Fi & MQTT Configuration
