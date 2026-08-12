@@ -113,7 +113,7 @@ void initTinyML() {
     static tflite::MicroErrorReporter microErrorReporter;
     errorReporter = &microErrorReporter;
 
-    model = tflite::GetModel(grain_model);
+    model = tflite::GetModel(g_model);
     if (model->version() != TFLITE_SCHEMA_VERSION) {
         TF_LITE_REPORT_ERROR(errorReporter, "Error: TinyML model schema mismatch!");
         return;
