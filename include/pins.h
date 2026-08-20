@@ -42,7 +42,7 @@
 #define LORA_SCK_PIN    7
 #define LORA_MISO_PIN   8
 #define LORA_MOSI_PIN   9
-#define LORA_CS_PIN     3
+#define LORA_CS_PIN     21
 #define LORA_RST_PIN    13
 #define LORA_DIO0_PIN   14
 
