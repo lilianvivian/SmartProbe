@@ -13,7 +13,7 @@
 #define BTN_GUARDIAN 4
 #define BTN_MONITOR  5
 
-#define LORA_FREQ    868E6  // Set to match regional frequency (433E6, 868E6, 915E6)
+#define LORA_FREQ    868E6  // Regional frequency (433E6, 868E6, 915E6)
 #define DEBOUNCE_MS  200
 
 // --- Hardware Objects ---
@@ -41,6 +41,7 @@ unsigned long lastPressTimeMonitor = 0;
 // --- Function Declarations ---
 void sendLoRaCommand(const char* action, const char* value);
 void parseIncomingLoRa();
+void parseIncomingSerial();
 void updateDisplay();
 void handleButtons();
 
@@ -69,7 +70,7 @@ void setup() {
     while (1);
   }
 
-  // Radio Configurations (Must match ESP32 node exactly)
+  // Radio Configurations
   LoRa.setSpreadingFactor(7);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5);
@@ -84,7 +85,8 @@ void setup() {
 
 void loop() {
   handleButtons();
-  parseIncomingLoRa();
+  parseIncomingSerial(); // Reads commands sent from the Node.js dashboard
+  parseIncomingLoRa();   // Reads telemetry arriving over radio
   updateDisplay();
 }
 
@@ -120,9 +122,33 @@ void handleButtons() {
   }
 }
 
+// --- Receive & Parse Commands from Node.js Dashboard ---
+void parseIncomingSerial() {
+  if (Serial.available() > 0) {
+    String serialInput = Serial.readStringUntil('\n');
+    serialInput.trim();
+
+    if (serialInput.length() == 0 || serialInput.charAt(0) != '{') {
+      return;
+    }
+
+    StaticJsonDocument<128> doc;
+    DeserializationError err = deserializeJson(doc, serialInput);
+
+    if (!err) {
+      const char* cmd = doc["cmd"] | "";
+      const char* val = doc["val"] | "";
+
+      if (strlen(cmd) > 0) {
+        // Broadcast dashboard command over LoRa
+        sendLoRaCommand(cmd, val);
+      }
+    }
+  }
+}
+
 // --- LoRa Command Dispatcher ---
 void sendLoRaCommand(const char* action, const char* value) {
-  // Use explicit static capacity for AVR safety
   StaticJsonDocument<128> doc;
   doc["cmd"] = action;
   doc["val"] = value;
@@ -140,6 +166,7 @@ void sendLoRaCommand(const char* action, const char* value) {
   lcd.setCursor(14, 0);
   lcd.print("TX");
 }
+
 // --- Receive & Parse Base Station Telemetry ---
 void parseIncomingLoRa() {
   int packetSize = LoRa.parsePacket();
@@ -157,7 +184,6 @@ void parseIncomingLoRa() {
       return; 
     }
 
-    // Static buffer prevents SRAM heap fragmentation on ATmega328P
     StaticJsonDocument<256> doc;
     DeserializationError err = deserializeJson(doc, payload);
 
@@ -201,10 +227,9 @@ void parseIncomingLoRa() {
 // --- Non-Blocking LCD Render Loop ---
 void updateDisplay() {
   static unsigned long lastLcdUpdate = 0;
-  if (millis() - lastLcdUpdate < 500) return; // Refresh LCD 2x per second
+  if (millis() - lastLcdUpdate < 500) return;
   lastLcdUpdate = millis();
 
-  // Check connection timeout (10 second threshold)
   bool linkOffline = (millis() - baseState.lastRxTime > 10000) || !baseState.lastDataValid;
 
   if (linkOffline) {
@@ -215,7 +240,6 @@ void updateDisplay() {
     return;
   }
 
-  // Line 1: Mode, Temperature, and Humidity
   char line0[17];
   char shortMode[5] = "INIT";
 
@@ -233,7 +257,6 @@ void updateDisplay() {
   lcd.setCursor(0, 0);
   lcd.print(line0);
 
-  // Line 2: VOC Air Quality Level & Alarm Status
   char line1[17];
   snprintf(line1, sizeof(line1), "VOC:%-4d ST:%-5s",
            baseState.voc,
