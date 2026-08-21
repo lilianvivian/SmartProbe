@@ -28,6 +28,9 @@ struct BaseStationState {
   bool breach = false;
   bool lastDataValid = false;
   unsigned long lastRxTime = 0;
+  int rssi = 0;             // dBm of the last packet
+  float snr = 0.0;          // dB
+  unsigned int packets = 0; // received since power-up
 } baseState;
 
 // --- Button Debounce Tracking ---
@@ -170,9 +173,24 @@ void parseIncomingLoRa() {
       baseState.breach = doc["breach"] | false;
       baseState.lastDataValid = true;
       baseState.lastRxTime = millis();
+      baseState.rssi = LoRa.packetRssi();
+      baseState.snr  = LoRa.packetSnr();
+      baseState.packets++;
 
-      Serial.print(F("Rx Telemetry OK: "));
-      Serial.println(payload);
+      // Re-emit for the USB dashboard with the radio stats folded in. Built
+      // with ArduinoJson rather than snprintf because AVR's printf has no
+      // float support - "%f" prints nothing on an ATmega328P.
+      StaticJsonDocument<192> out;
+      out["temp"]    = baseState.temp;
+      out["hum"]     = baseState.hum;
+      out["voc"]     = baseState.voc;
+      out["mode"]    = baseState.mode;
+      out["breach"]  = baseState.breach;
+      out["rssi"]    = baseState.rssi;
+      out["snr"]     = baseState.snr;
+      out["packets"] = baseState.packets;
+      serializeJson(out, Serial);
+      Serial.println();
     } else {
       Serial.print(F("Deserialization failed: "));
       Serial.println(err.c_str());
