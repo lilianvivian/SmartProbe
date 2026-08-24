@@ -44,6 +44,7 @@ void parseIncomingLoRa();
 void parseIncomingSerial();
 void updateDisplay();
 void handleButtons();
+void handleSerialCommands();
 
 void setup() {
   Serial.begin(115200);
@@ -85,9 +86,55 @@ void setup() {
 
 void loop() {
   handleButtons();
-  parseIncomingSerial(); // Reads commands sent from the Node.js dashboard
-  parseIncomingLoRa();   // Reads telemetry arriving over radio
+  handleSerialCommands();
+  parseIncomingLoRa();
   updateDisplay();
+}
+
+// --- USB Command Handler -----------------------------------------------------
+// The dashboard drives the same commands as the three physical buttons, sent as
+// newline-terminated JSON over USB: {"cmd":"SET_MODE","val":"GUARDIAN"}
+// Everything funnels into sendLoRaCommand(), so the node cannot tell whether a
+// command came from a button or the browser.
+void handleSerialCommands() {
+  static char buf[64];
+  static byte len = 0;
+
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == '\n' || c == '\r') {
+      if (len == 0) continue;          // ignore bare line endings
+      buf[len] = '\0';
+      len = 0;
+
+      StaticJsonDocument<96> doc;
+      if (deserializeJson(doc, buf)) {
+        Serial.println(F("Serial cmd: bad JSON"));
+        continue;
+      }
+
+      const char* cmd = doc["cmd"];
+      const char* val = doc["val"] | "";
+      if (!cmd) {
+        Serial.println(F("Serial cmd: missing 'cmd'"));
+        continue;
+      }
+
+      Serial.print(F("Serial cmd -> "));
+      Serial.print(cmd);
+      Serial.print(' ');
+      Serial.println(val);
+
+      sendLoRaCommand(cmd, val);
+    }
+    else if (len < sizeof(buf) - 1) {
+      buf[len++] = c;
+    }
+    else {
+      len = 0;   // overlong line: discard rather than truncate into a bad parse
+    }
+  }
 }
 
 // --- Button Handler Routine ---
@@ -184,19 +231,33 @@ void parseIncomingLoRa() {
       return; 
     }
 
-    StaticJsonDocument<256> doc;
-    DeserializationError err = deserializeJson(doc, payload);
+    // Static buffer prevents SRAM heap fragmentation on ATmega328P.
+    //
+    // The parse document is deliberately confined to its own scope: every field
+    // is copied into baseState below, so holding it open while the 192-byte
+    // output document is built would put 448 bytes of JsonDocument on the stack
+    // at once. With ~1 KB of free SRAM that is close enough to the edge to
+    // corrupt the heap, and the LoRa driver's state sits in it.
+    bool parsed = false;
+    DeserializationError err;   // 1-byte value type, safe to outlive the doc
+    {
+      StaticJsonDocument<256> doc;
+      err = deserializeJson(doc, payload);
+      if (!err) {
+        baseState.temp = doc["temp"] | 0.0f;
+        baseState.hum = doc["hum"] | 0.0f;
+        baseState.voc = doc["voc"] | 0;
 
-    if (!err) {
-      baseState.temp = doc["temp"] | 0.0f;
-      baseState.hum = doc["hum"] | 0.0f;
-      baseState.voc = doc["voc"] | 0;
-      
-      const char* modeStr = doc["mode"] | "UNKNOWN";
-      strncpy(baseState.mode, modeStr, sizeof(baseState.mode) - 1);
-      baseState.mode[sizeof(baseState.mode) - 1] = '\0';
-      
-      baseState.breach = doc["breach"] | false;
+        const char* modeStr = doc["mode"] | "UNKNOWN";
+        strncpy(baseState.mode, modeStr, sizeof(baseState.mode) - 1);
+        baseState.mode[sizeof(baseState.mode) - 1] = '\0';
+
+        baseState.breach = doc["breach"] | false;
+        parsed = true;
+      }
+    }   // doc released here - its 256 bytes are reclaimed before `out` exists
+
+    if (parsed) {
       baseState.lastDataValid = true;
       baseState.lastRxTime = millis();
       baseState.rssi = LoRa.packetRssi();

@@ -117,6 +117,26 @@
   .banner .detail { color: var(--ink-2); font-size: 0.95rem; }
   .banner .rec { margin-left: auto; font-weight: 600; }
 
+  /* actuation controls */
+  .actbar {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
+    margin: 0 0 18px;
+  }
+  .actbar .ctl-label { color: var(--muted); font-size: 0.78rem;
+    text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+  .act {
+    font: inherit; font-size: 0.85rem; font-weight: 600;
+    padding: 7px 16px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--surface); color: var(--ink);
+  }
+  .act:hover:not(:disabled) { border-color: var(--baseline); }
+  .act:disabled { opacity: 0.4; cursor: not-allowed; }
+  .act.danger { color: var(--critical); }
+  .act[data-pending="true"] { opacity: 0.55; }
+  .act-msg { color: var(--muted); font-size: 0.82rem; }
+  .act-msg.ok   { color: var(--good); }
+  .act-msg.fail { color: var(--critical); }
+
   /* stat tiles */
   .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
   @media (max-width: 720px) { .grid { grid-template-columns: repeat(2, 1fr); } }
@@ -260,6 +280,14 @@
     <span class="state" id="statusText">NO DATA</span>
     <span class="detail" id="statusCause"></span>
     <span class="rec" id="statusRec"></span>
+  </div>
+
+  <div class="actbar">
+    <span class="ctl-label">Control</span>
+    <button class="act" id="btnGuardian" type="button" disabled>Guardian</button>
+    <button class="act" id="btnMonitor"  type="button" disabled>Monitor</button>
+    <button class="act danger" id="btnSleep" type="button" disabled>Sleep</button>
+    <span class="act-msg" id="actMsg"></span>
   </div>
 
   <div class="grid">
@@ -861,31 +889,67 @@ function rssiQuality(rssi) {
   return "marginal";
 }
 
-// The ground station treats 10s of silence as a dropped link (main.cpp:190).
-// Time passes without new packets, so this is redrawn on a timer too.
-const LINK_TIMEOUT_MS = 10000;
+// The node sleeps on an inactivity timeout, not a fixed cycle: after
+// AWAKE_INTERVAL_SEC (2 min) of quiet it deep-sleeps for SLEEP_DURATION_SEC
+// (3 min) — but ONLY when idle. It refuses to sleep while armed (OVERRIDE) or
+// breached. So silence is expected when idle and suspicious when armed.
+const NODE_SLEEP_S  = 180;
+const LINK_LIVE_MS  = 10000;                      // telemetry arrives every 2s
+const LINK_LOST_MS  = (NODE_SLEEP_S + 60) * 1000; // a full sleep plus margin
 let lastPacketAt = 0;
+let nodeStaysAwake = false;   // armed or breached at last contact
+
+function fmtAge(ms) {
+  const s = Math.round(ms / 1000);
+  if (s < 60) return s + "s";
+  const m = Math.floor(s / 60);
+  return m + "m" + (s % 60 ? " " + (s % 60) + "s" : "");
+}
 
 function renderLink() {
   const el = $("linkVal");
-  if (!lastPacketAt) { el.textContent = "—"; return; }
+  if (!lastPacketAt) {
+    el.textContent = "—";
+    el.style.color = "";
+    el.title = "";
+    return;
+  }
   const age = Date.now() - lastPacketAt;
-  if (age > LINK_TIMEOUT_MS) {
-    el.textContent = "OFFLINE";
-    el.style.color = "var(--critical)";
-  } else {
-    el.textContent = age < 1500 ? "live" : Math.round(age / 1000) + "s ago";
+
+  if (age < LINK_LIVE_MS) {
+    el.textContent = "live";
     el.style.color = "var(--good)";
+    el.title = "Receiving telemetry.";
+  } else if (nodeStaysAwake) {
+    // Armed or breached at last contact, so the node should not be sleeping.
+    el.textContent = "NO SIGNAL " + fmtAge(age);
+    el.style.color = "var(--critical)";
+    el.title = "The node was armed or breached at last contact, and in that "
+             + "state it refuses to sleep — so this silence is a lost link, "
+             + "not a power-saving nap.";
+  } else if (age < LINK_LOST_MS) {
+    el.textContent = "sleeping " + fmtAge(age);
+    el.style.color = "var(--warning)";
+    el.title = "No telemetry, but the node was idle and disarmed, so it has "
+             + "likely deep-slept after its 2 min inactivity timeout. It wakes "
+             + "itself about 3 min later.";
+  } else {
+    el.textContent = "OFFLINE " + fmtAge(age);
+    el.style.color = "var(--critical)";
+    el.title = "Silent for longer than a full sleep cycle — the link is "
+             + "probably genuinely lost.";
   }
 }
 
 // Mirrors the node's indicator LEDs: monitoring = SAFE, guarding without a
 // breach = WARNING, guarding with a breach = CRITICAL.
+// The node folds breach state into `mode` (OVERRIDE / GUARDIAN / MONITOR), so
+// `breach` is the reliable signal and mode only distinguishes armed from idle.
 function deriveStatus(mode, breach) {
   if (typeof breach !== "boolean") return undefined;
+  if (breach) return "CRITICAL";
   const m = String(mode || "").toUpperCase();
-  if (m === "MONITOR" || m === "INSPECT") return "SAFE";
-  return breach ? "CRITICAL" : "WARNING";
+  return (m === "OVERRIDE") ? "WARNING" : "SAFE";
 }
 
 function normalize(raw) {
@@ -952,11 +1016,18 @@ function applyReport(raw) {
   $("statusRec").textContent = r.recommendation || "";
 
   lastPacketAt = Date.now();
+  // The node stays awake while armed or breached, so remember which it was —
+  // it decides whether later silence means "sleeping" or "link lost".
+  nodeStaysAwake = String(r.mode || "").toUpperCase() === "OVERRIDE"
+                || r.status === "CRITICAL";
   renderLink();
+  checkPending(r);
 
+  // Only state actuator status when the payload actually carries it — the LoRa
+  // node sends neither field, and "fan off" would be an unfounded claim.
   $("modeVal").textContent =
     (r.mode || "—") +
-    (r.runFan ? " · fan ON" : " · fan off") +
+    (typeof r.runFan === "boolean" ? (r.runFan ? " · fan ON" : " · fan off") : "") +
     (r.soundAlarm ? " · ALARM" : "");
 
   if (r.status === "CRITICAL") criticalAlert();
@@ -1007,6 +1078,7 @@ async function connectSerial() {
     port = await navigator.serial.requestPort();
     await port.open({ baudRate: 115200 });
     setConn("on", "serial connected");
+    refreshControls();
     keepReading = true;
     readSerialLoop();
   } catch (e) {
@@ -1021,6 +1093,8 @@ async function disconnectSerial() {
     try { await port.close(); } catch (e) { /* already closed */ }
     port = null;
   }
+  clearPending();
+  refreshControls();
 }
 
 async function readSerialLoop() {
@@ -1056,6 +1130,94 @@ function handleSerialLine(line) {
   try {
     applyReport(JSON.parse(line.slice(i)));
   } catch (e) { /* partial or non-telemetry line */ }
+}
+
+// ---- actuation ---------------------------------------------------------------
+// Sends the same commands the ground station's physical buttons issue. The Uno
+// forwards them verbatim to sendLoRaCommand(), so the node cannot distinguish a
+// dashboard click from a button press.
+//
+// LoRa transmit here is fire-and-forget with no acknowledgement, so a click is
+// never treated as success — it stays pending until a telemetry packet shows the
+// node actually changed state.
+const PENDING_MS = 10000;
+let pending = null;   // { label, check, at, btn }
+
+function actMsg(text, cls) {
+  const el = $("actMsg");
+  el.textContent = text;
+  el.className = "act-msg" + (cls ? " " + cls : "");
+}
+
+function controlsEnabled() {
+  return source === "serial" && port !== null;
+}
+
+const HINT_CONNECT = "connect over USB serial to send commands";
+
+function refreshControls() {
+  const on = controlsEnabled();
+  ["btnGuardian", "btnMonitor", "btnSleep"].forEach((id) => {
+    $(id).disabled = !on || pending !== null;
+  });
+  if (!on && !pending) {
+    actMsg(HINT_CONNECT);
+  } else if (on && !pending && $("actMsg").textContent === HINT_CONNECT) {
+    // clear only the hint — a pending or confirmed message must survive
+    actMsg("");
+  }
+}
+
+async function writeCommand(cmd, val) {
+  if (!port || !port.writable) {
+    actMsg("not connected", "fail");
+    return false;
+  }
+  const writer = port.writable.getWriter();
+  try {
+    await writer.write(new TextEncoder().encode(JSON.stringify({ cmd, val }) + "\n"));
+    return true;
+  } catch (e) {
+    actMsg("send failed: " + e.message, "fail");
+    return false;
+  } finally {
+    writer.releaseLock();
+  }
+}
+
+async function sendAction(label, cmd, val, check, btnId) {
+  if (pending) return;
+  const btn = $(btnId);
+  pending = { label, check, at: Date.now(), btn };
+  btn.setAttribute("data-pending", "true");
+  refreshControls();
+  actMsg(label + " — sent, waiting for the node…");
+
+  if (!(await writeCommand(cmd, val))) { clearPending(); return; }
+
+  setTimeout(() => {
+    if (pending && Date.now() - pending.at >= PENDING_MS) {
+      const l = pending.label;
+      clearPending();
+      actMsg(l + " — no response, the node may not have heard it", "fail");
+    }
+  }, PENDING_MS + 100);
+}
+
+function clearPending() {
+  if (pending && pending.btn) pending.btn.removeAttribute("data-pending");
+  pending = null;
+  refreshControls();
+}
+
+// Called from applyReport once each packet is normalized.
+function checkPending(r) {
+  if (!pending) return;
+  if (pending.check(r)) {
+    const l = pending.label;
+    clearPending();
+    actMsg(l + " — confirmed by the node", "ok");
+  }
 }
 
 function connectMqtt() {
@@ -1105,6 +1267,8 @@ function setSource(next) {
   $("srcSerial").setAttribute("aria-pressed", String(next === "serial"));
   $("srcMqtt").setAttribute("aria-pressed", String(next === "mqtt"));
   $("mqttFields").hidden = (next !== "mqtt");
+  clearPending();
+  refreshControls();
   setConn("", next === "serial" ? "click Connect and pick the board" : "");
 }
 
@@ -1189,6 +1353,33 @@ function wireChartInteraction() {
 $("connectBtn").addEventListener("click", connect);
 $("srcSerial").addEventListener("click", () => setSource("serial"));
 $("srcMqtt").addEventListener("click", () => setSource("mqtt"));
+
+// The node reports mode as OVERRIDE / GUARDIAN / MONITOR, where GUARDIAN means
+// "breached" rather than "armed". So arming is confirmed by mode == OVERRIDE,
+// and disarming by mode != OVERRIDE — which stays correct during a breach.
+$("btnGuardian").addEventListener("click", () =>
+  sendAction("Guardian", "SET_MODE", "GUARDIAN",
+    (r) => String(r.mode || "").toUpperCase() === "OVERRIDE", "btnGuardian"));
+
+$("btnMonitor").addEventListener("click", () =>
+  sendAction("Monitor", "SET_MODE", "MONITOR",
+    (r) => String(r.mode || "").toUpperCase() !== "OVERRIDE", "btnMonitor"));
+
+// Sleep has no positive confirmation — the node stops transmitting, so the Link
+// tile is the evidence. Recovery is automatic: the node's only wake source is
+// esp_sleep_enable_timer_wakeup(SLEEP_TIMER_US), so it returns on its own.
+$("btnSleep").addEventListener("click", async () => {
+  if (!confirm(
+    "Put the probe to sleep now?\n\n" +
+    "It will stop transmitting for about 3 minutes, then wake itself and " +
+    "resume — its only wake source is a timer, so no trip to the probe is " +
+    "needed.\n\n" +
+    "Note this overrides the node's own rule of staying awake while armed " +
+    "or while a threshold is breached."
+  )) return;
+  if (await writeCommand("POWER", "OFF"))
+    actMsg("Sleep — sent; the node should return within a few minutes");
+});
 $("clearBtn").addEventListener("click", () => {
   if (!confirm("Delete all stored readings from this browser?")) return;
   readings = [];
@@ -1212,6 +1403,7 @@ window.addEventListener("load", () => {
   renderHistory();
   // Web Serial's port picker requires a user gesture, so serial cannot
   // auto-connect on load. MQTT still can.
+  refreshControls();
   if (source === "mqtt") connect();
   else setConn("", "click Connect and pick the board");
 });
