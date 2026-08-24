@@ -43,6 +43,7 @@ void sendLoRaCommand(const char* action, const char* value);
 void parseIncomingLoRa();
 void updateDisplay();
 void handleButtons();
+void handleSerialCommands();
 
 void setup() {
   Serial.begin(115200);
@@ -84,8 +85,55 @@ void setup() {
 
 void loop() {
   handleButtons();
+  handleSerialCommands();
   parseIncomingLoRa();
   updateDisplay();
+}
+
+// --- USB Command Handler -----------------------------------------------------
+// The dashboard drives the same commands as the three physical buttons, sent as
+// newline-terminated JSON over USB: {"cmd":"SET_MODE","val":"GUARDIAN"}
+// Everything funnels into sendLoRaCommand(), so the node cannot tell whether a
+// command came from a button or the browser.
+void handleSerialCommands() {
+  static char buf[64];
+  static byte len = 0;
+
+  while (Serial.available()) {
+    char c = Serial.read();
+
+    if (c == '\n' || c == '\r') {
+      if (len == 0) continue;          // ignore bare line endings
+      buf[len] = '\0';
+      len = 0;
+
+      StaticJsonDocument<96> doc;
+      if (deserializeJson(doc, buf)) {
+        Serial.println(F("Serial cmd: bad JSON"));
+        continue;
+      }
+
+      const char* cmd = doc["cmd"];
+      const char* val = doc["val"] | "";
+      if (!cmd) {
+        Serial.println(F("Serial cmd: missing 'cmd'"));
+        continue;
+      }
+
+      Serial.print(F("Serial cmd -> "));
+      Serial.print(cmd);
+      Serial.print(' ');
+      Serial.println(val);
+
+      sendLoRaCommand(cmd, val);
+    }
+    else if (len < sizeof(buf) - 1) {
+      buf[len++] = c;
+    }
+    else {
+      len = 0;   // overlong line: discard rather than truncate into a bad parse
+    }
+  }
 }
 
 // --- Button Handler Routine ---
