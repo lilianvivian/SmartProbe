@@ -5,32 +5,42 @@
 #include <ArduinoJson.h>
 
 // --- Pin Definitions ---
-#define LORA_CS    10
-#define LORA_RST   9
-#define LORA_DIO0  2
+#define LORA_CS     10
+#define LORA_RST    9
+#define LORA_DIO0   2
 
 #define BTN_POWER    3
 #define BTN_GUARDIAN 4
 #define BTN_MONITOR  5
 
-#define LORA_FREQ    868E6  // Regional frequency (433E6, 868E6, 915E6)
+#define LORA_FREQ    868E6  // Frequency (433E6, 868E6, 915E6)
 #define DEBOUNCE_MS  200
+
+#define EMA_ALPHA    0.3f   // Smoothing factor for receiver-side dynamic averages
 
 // --- Hardware Objects ---
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
 
 // --- System Telemetry State Structure ---
 struct BaseStationState {
+  // Raw 30-sec window batch averages (from ESP32 transmitter)
   float temp = 0.0;
   float hum = 0.0;
   int voc = 0;
+  unsigned int sampleCount = 0;
+
+  // Local Receiver-side Exponential Moving Averages (EMA)
+  float emaTemp = 0.0;
+  float emaHum = 0.0;
+  float emaVoc = 0.0;
+
   char mode[10] = "INIT";
   bool breach = false;
   bool lastDataValid = false;
   unsigned long lastRxTime = 0;
-  int rssi = 0;             // dBm of the last packet
+  int rssi = 0;             // dBm of last received packet
   float snr = 0.0;          // dB
-  unsigned int packets = 0; // received since power-up
+  unsigned int packets = 0; // Received since boot
 } baseState;
 
 // --- Button Debounce Tracking ---
@@ -41,7 +51,6 @@ unsigned long lastPressTimeMonitor = 0;
 // --- Function Declarations ---
 void sendLoRaCommand(const char* action, const char* value);
 void parseIncomingLoRa();
-void parseIncomingSerial();
 void updateDisplay();
 void handleButtons();
 void handleSerialCommands();
@@ -92,10 +101,6 @@ void loop() {
 }
 
 // --- USB Command Handler -----------------------------------------------------
-// The dashboard drives the same commands as the three physical buttons, sent as
-// newline-terminated JSON over USB: {"cmd":"SET_MODE","val":"GUARDIAN"}
-// Everything funnels into sendLoRaCommand(), so the node cannot tell whether a
-// command came from a button or the browser.
 void handleSerialCommands() {
   static char buf[64];
   static byte len = 0;
@@ -104,7 +109,7 @@ void handleSerialCommands() {
     char c = Serial.read();
 
     if (c == '\n' || c == '\r') {
-      if (len == 0) continue;          // ignore bare line endings
+      if (len == 0) continue;
       buf[len] = '\0';
       len = 0;
 
@@ -132,7 +137,7 @@ void handleSerialCommands() {
       buf[len++] = c;
     }
     else {
-      len = 0;   // overlong line: discard rather than truncate into a bad parse
+      len = 0; // Discard overlong lines
     }
   }
 }
@@ -141,7 +146,6 @@ void handleSerialCommands() {
 void handleButtons() {
   unsigned long now = millis();
 
-  // Button 1: Power Toggle Command
   if (digitalRead(BTN_POWER) == LOW) {
     if (now - lastPressTimePower > DEBOUNCE_MS) {
       Serial.println(F("BTN: Power Toggle Pressed"));
@@ -150,7 +154,6 @@ void handleButtons() {
     }
   }
 
-  // Button 2: Force Guardian Mode Command
   if (digitalRead(BTN_GUARDIAN) == LOW) {
     if (now - lastPressTimeGuardian > DEBOUNCE_MS) {
       Serial.println(F("BTN: Switch to GUARDIAN Pressed"));
@@ -159,37 +162,11 @@ void handleButtons() {
     }
   }
 
-  // Button 3: Force Monitor/Inspect Mode Command
   if (digitalRead(BTN_MONITOR) == LOW) {
     if (now - lastPressTimeMonitor > DEBOUNCE_MS) {
       Serial.println(F("BTN: Switch to MONITOR Pressed"));
       sendLoRaCommand("SET_MODE", "MONITOR");
       lastPressTimeMonitor = now;
-    }
-  }
-}
-
-// --- Receive & Parse Commands from Node.js Dashboard ---
-void parseIncomingSerial() {
-  if (Serial.available() > 0) {
-    String serialInput = Serial.readStringUntil('\n');
-    serialInput.trim();
-
-    if (serialInput.length() == 0 || serialInput.charAt(0) != '{') {
-      return;
-    }
-
-    StaticJsonDocument<128> doc;
-    DeserializationError err = deserializeJson(doc, serialInput);
-
-    if (!err) {
-      const char* cmd = doc["cmd"] | "";
-      const char* val = doc["val"] | "";
-
-      if (strlen(cmd) > 0) {
-        // Broadcast dashboard command over LoRa
-        sendLoRaCommand(cmd, val);
-      }
     }
   }
 }
@@ -214,7 +191,7 @@ void sendLoRaCommand(const char* action, const char* value) {
   lcd.print("TX");
 }
 
-// --- Receive & Parse Base Station Telemetry ---
+// --- Receive & Parse 30-Second Batch Telemetry from ESP32 ---
 void parseIncomingLoRa() {
   int packetSize = LoRa.parsePacket();
   if (packetSize > 0) {
@@ -231,22 +208,17 @@ void parseIncomingLoRa() {
       return; 
     }
 
-    // Static buffer prevents SRAM heap fragmentation on ATmega328P.
-    //
-    // The parse document is deliberately confined to its own scope: every field
-    // is copied into baseState below, so holding it open while the 192-byte
-    // output document is built would put 448 bytes of JsonDocument on the stack
-    // at once. With ~1 KB of free SRAM that is close enough to the edge to
-    // corrupt the heap, and the LoRa driver's state sits in it.
     bool parsed = false;
-    DeserializationError err;   // 1-byte value type, safe to outlive the doc
+    DeserializationError err;
+
     {
       StaticJsonDocument<256> doc;
       err = deserializeJson(doc, payload);
       if (!err) {
-        baseState.temp = doc["temp"] | 0.0f;
-        baseState.hum = doc["hum"] | 0.0f;
-        baseState.voc = doc["voc"] | 0;
+        baseState.temp        = doc["temp"] | 0.0f;
+        baseState.hum         = doc["hum"] | 0.0f;
+        baseState.voc         = doc["voc"] | 0;
+        baseState.sampleCount = doc["samples"] | 0;
 
         const char* modeStr = doc["mode"] | "UNKNOWN";
         strncpy(baseState.mode, modeStr, sizeof(baseState.mode) - 1);
@@ -255,27 +227,40 @@ void parseIncomingLoRa() {
         baseState.breach = doc["breach"] | false;
         parsed = true;
       }
-    }   // doc released here - its 256 bytes are reclaimed before `out` exists
+    }
 
     if (parsed) {
+      // Calculate receiver moving averages
+      if (!baseState.lastDataValid) {
+        baseState.emaTemp = baseState.temp;
+        baseState.emaHum  = baseState.hum;
+        baseState.emaVoc  = (float)baseState.voc;
+      } else {
+        baseState.emaTemp = (EMA_ALPHA * baseState.temp) + ((1.0f - EMA_ALPHA) * baseState.emaTemp);
+        baseState.emaHum  = (EMA_ALPHA * baseState.hum)  + ((1.0f - EMA_ALPHA) * baseState.emaHum);
+        baseState.emaVoc  = (EMA_ALPHA * (float)baseState.voc) + ((1.0f - EMA_ALPHA) * baseState.emaVoc);
+      }
+
       baseState.lastDataValid = true;
-      baseState.lastRxTime = millis();
-      baseState.rssi = LoRa.packetRssi();
-      baseState.snr  = LoRa.packetSnr();
+      baseState.lastRxTime    = millis();
+      baseState.rssi          = LoRa.packetRssi();
+      baseState.snr           = LoRa.packetSnr();
       baseState.packets++;
 
-      // Re-emit for the USB dashboard with the radio stats folded in. Built
-      // with ArduinoJson rather than snprintf because AVR's printf has no
-      // float support - "%f" prints nothing on an ATmega328P.
-      StaticJsonDocument<192> out;
-      out["temp"]    = baseState.temp;
-      out["hum"]     = baseState.hum;
-      out["voc"]     = baseState.voc;
-      out["mode"]    = baseState.mode;
-      out["breach"]  = baseState.breach;
-      out["rssi"]    = baseState.rssi;
-      out["snr"]     = baseState.snr;
-      out["packets"] = baseState.packets;
+      // Forward combined metrics to dashboard over USB Serial
+      StaticJsonDocument<224> out;
+      out["temp"]     = baseState.temp;
+      out["hum"]      = baseState.hum;
+      out["voc"]      = baseState.voc;
+      out["emaTemp"]  = baseState.emaTemp;
+      out["emaHum"]   = baseState.emaHum;
+      out["samples"]  = baseState.sampleCount;
+      out["mode"]     = baseState.mode;
+      out["breach"]   = baseState.breach;
+      out["rssi"]     = baseState.rssi;
+      out["snr"]      = baseState.snr;
+      out["packets"]  = baseState.packets;
+      
       serializeJson(out, Serial);
       Serial.println();
     } else {
@@ -291,13 +276,14 @@ void updateDisplay() {
   if (millis() - lastLcdUpdate < 500) return;
   lastLcdUpdate = millis();
 
-  bool linkOffline = (millis() - baseState.lastRxTime > 10000) || !baseState.lastDataValid;
+  // Handle offline link condition (e.g. ESP32 Deep Sleep duration exceeds 35s window)
+  bool linkOffline = (millis() - baseState.lastRxTime > 40000) || !baseState.lastDataValid;
 
   if (linkOffline) {
     lcd.setCursor(0, 0);
-    lcd.print("LINK: OFFLINE   ");
+    lcd.print("LINK: SLEEP/OFF ");
     lcd.setCursor(0, 1);
-    lcd.print("Waiting Base... ");
+    lcd.print("Waiting Node... ");
     return;
   }
 
@@ -310,17 +296,20 @@ void updateDisplay() {
     strncpy(shortMode, "INSP", 5);
   }
 
+  // Row 0: Operating Mode, Smoothed Temp & Humidity
   snprintf(line0, sizeof(line0), "%-4s T:%2dC H:%2d%%",
            shortMode,
-           (int)baseState.temp,
-           (int)baseState.hum);
+           (int)baseState.emaTemp,
+           (int)baseState.emaHum);
 
   lcd.setCursor(0, 0);
   lcd.print(line0);
 
+  // Row 1: VOC metric, breach state, and sample count
   char line1[17];
-  snprintf(line1, sizeof(line1), "VOC:%-4d ST:%-5s",
-           baseState.voc,
+  snprintf(line1, sizeof(line1), "V:%-4d N:%-2u %-5s",
+           (int)baseState.emaVoc,
+           baseState.sampleCount,
            baseState.breach ? "ALERT" : "OK   ");
 
   lcd.setCursor(0, 1);
