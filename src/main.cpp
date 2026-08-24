@@ -10,6 +10,7 @@
 #include <freertos/semphr.h>
 #include <freertos/event_groups.h>
 #include "pins.h"
+#include <nvs_flash.h>
 
 // --- TinyML TensorFlow Lite Headers ---
 #include "tensorflow/lite/micro/all_ops_resolver.h"
@@ -171,7 +172,7 @@ void triggerDeepSleep() {
 
   // 1. Put LoRa Transceiver into Sleep Mode prior to MCU Deep Sleep
   if (xSpiMutex != NULL && xSemaphoreTake(xSpiMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-    LoRa.sleep();
+    LoRa.receive();
     xSemaphoreGive(xSpiMutex);
   }
 
@@ -179,6 +180,10 @@ void triggerDeepSleep() {
   esp_sleep_enable_timer_wakeup(SLEEP_TIMER_US);
   
   #if defined(LORA_DIO0_PIN) && (LORA_DIO0_PIN >= 0)
+  
+  gpio_pullup_dis((gpio_num_t)LORA_DIO0_PIN);
+  gpio_pulldown_en((gpio_num_t)LORA_DIO0_PIN);
+
   esp_sleep_enable_ext0_wakeup((gpio_num_t)LORA_DIO0_PIN, 1); // HIGH interrupt from LoRa
   #endif
 
@@ -497,6 +502,13 @@ void vTaskSystemEngine(void *pvParameters) {
 
 void setup() {
   Serial.begin(115200);
+
+  esp_err_t err = nvs_flash_init();
+  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    err = nvs_flash_init();
+  }
+
   checkWakeupReason();
   loadSubscribers();
 
