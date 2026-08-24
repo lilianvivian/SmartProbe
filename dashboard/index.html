@@ -889,13 +889,15 @@ function rssiQuality(rssi) {
   return "marginal";
 }
 
-// The node duty-cycles to save battery — SLEEP_DURATION_SEC is 3 min against
-// AWAKE_INTERVAL_SEC of 2 min — so silence is normal for minutes at a time and
-// must not be reported as a fault. Telemetry arrives every 2s while it is awake.
+// The node sleeps on an inactivity timeout, not a fixed cycle: after
+// AWAKE_INTERVAL_SEC (2 min) of quiet it deep-sleeps for SLEEP_DURATION_SEC
+// (3 min) — but ONLY when idle. It refuses to sleep while armed (OVERRIDE) or
+// breached. So silence is expected when idle and suspicious when armed.
 const NODE_SLEEP_S  = 180;
-const LINK_LIVE_MS  = 10000;                      // still inside the awake window
+const LINK_LIVE_MS  = 10000;                      // telemetry arrives every 2s
 const LINK_LOST_MS  = (NODE_SLEEP_S + 60) * 1000; // a full sleep plus margin
 let lastPacketAt = 0;
+let nodeStaysAwake = false;   // armed or breached at last contact
 
 function fmtAge(ms) {
   const s = Math.round(ms / 1000);
@@ -918,12 +920,19 @@ function renderLink() {
     el.textContent = "live";
     el.style.color = "var(--good)";
     el.title = "Receiving telemetry.";
+  } else if (nodeStaysAwake) {
+    // Armed or breached at last contact, so the node should not be sleeping.
+    el.textContent = "NO SIGNAL " + fmtAge(age);
+    el.style.color = "var(--critical)";
+    el.title = "The node was armed or breached at last contact, and in that "
+             + "state it refuses to sleep — so this silence is a lost link, "
+             + "not a power-saving nap.";
   } else if (age < LINK_LOST_MS) {
-    // Expected: the node sleeps ~3 min in every ~5. Not a fault yet.
     el.textContent = "sleeping " + fmtAge(age);
     el.style.color = "var(--warning)";
-    el.title = "No telemetry, but within the node's normal sleep cycle "
-             + "(about 2 min awake, 3 min asleep). It should return on its own.";
+    el.title = "No telemetry, but the node was idle and disarmed, so it has "
+             + "likely deep-slept after its 2 min inactivity timeout. It wakes "
+             + "itself about 3 min later.";
   } else {
     el.textContent = "OFFLINE " + fmtAge(age);
     el.style.color = "var(--critical)";
@@ -1007,6 +1016,10 @@ function applyReport(raw) {
   $("statusRec").textContent = r.recommendation || "";
 
   lastPacketAt = Date.now();
+  // The node stays awake while armed or breached, so remember which it was —
+  // it decides whether later silence means "sleeping" or "link lost".
+  nodeStaysAwake = String(r.mode || "").toUpperCase() === "OVERRIDE"
+                || r.status === "CRITICAL";
   renderLink();
   checkPending(r);
 
@@ -1140,12 +1153,19 @@ function controlsEnabled() {
   return source === "serial" && port !== null;
 }
 
+const HINT_CONNECT = "connect over USB serial to send commands";
+
 function refreshControls() {
   const on = controlsEnabled();
   ["btnGuardian", "btnMonitor", "btnSleep"].forEach((id) => {
     $(id).disabled = !on || pending !== null;
   });
-  if (!on && !pending) actMsg("connect over USB serial to send commands");
+  if (!on && !pending) {
+    actMsg(HINT_CONNECT);
+  } else if (on && !pending && $("actMsg").textContent === HINT_CONNECT) {
+    // clear only the hint — a pending or confirmed message must survive
+    actMsg("");
+  }
 }
 
 async function writeCommand(cmd, val) {
@@ -1351,9 +1371,11 @@ $("btnMonitor").addEventListener("click", () =>
 $("btnSleep").addEventListener("click", async () => {
   if (!confirm(
     "Put the probe to sleep now?\n\n" +
-    "The node already duty-cycles on its own — roughly 2 minutes awake, " +
-    "3 minutes asleep. This just starts the next sleep early; it will wake " +
-    "itself and resume transmitting within a few minutes."
+    "It will stop transmitting for about 3 minutes, then wake itself and " +
+    "resume — its only wake source is a timer, so no trip to the probe is " +
+    "needed.\n\n" +
+    "Note this overrides the node's own rule of staying awake while armed " +
+    "or while a threshold is breached."
   )) return;
   if (await writeCommand("POWER", "OFF"))
     actMsg("Sleep — sent; the node should return within a few minutes");

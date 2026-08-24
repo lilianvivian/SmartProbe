@@ -205,20 +205,33 @@ void parseIncomingLoRa() {
       return; 
     }
 
-    // Static buffer prevents SRAM heap fragmentation on ATmega328P
-    StaticJsonDocument<256> doc;
-    DeserializationError err = deserializeJson(doc, payload);
+    // Static buffer prevents SRAM heap fragmentation on ATmega328P.
+    //
+    // The parse document is deliberately confined to its own scope: every field
+    // is copied into baseState below, so holding it open while the 192-byte
+    // output document is built would put 448 bytes of JsonDocument on the stack
+    // at once. With ~1 KB of free SRAM that is close enough to the edge to
+    // corrupt the heap, and the LoRa driver's state sits in it.
+    bool parsed = false;
+    DeserializationError err;   // 1-byte value type, safe to outlive the doc
+    {
+      StaticJsonDocument<256> doc;
+      err = deserializeJson(doc, payload);
+      if (!err) {
+        baseState.temp = doc["temp"] | 0.0f;
+        baseState.hum = doc["hum"] | 0.0f;
+        baseState.voc = doc["voc"] | 0;
 
-    if (!err) {
-      baseState.temp = doc["temp"] | 0.0f;
-      baseState.hum = doc["hum"] | 0.0f;
-      baseState.voc = doc["voc"] | 0;
-      
-      const char* modeStr = doc["mode"] | "UNKNOWN";
-      strncpy(baseState.mode, modeStr, sizeof(baseState.mode) - 1);
-      baseState.mode[sizeof(baseState.mode) - 1] = '\0';
-      
-      baseState.breach = doc["breach"] | false;
+        const char* modeStr = doc["mode"] | "UNKNOWN";
+        strncpy(baseState.mode, modeStr, sizeof(baseState.mode) - 1);
+        baseState.mode[sizeof(baseState.mode) - 1] = '\0';
+
+        baseState.breach = doc["breach"] | false;
+        parsed = true;
+      }
+    }   // doc released here - its 256 bytes are reclaimed before `out` exists
+
+    if (parsed) {
       baseState.lastDataValid = true;
       baseState.lastRxTime = millis();
       baseState.rssi = LoRa.packetRssi();
