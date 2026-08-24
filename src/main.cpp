@@ -2,7 +2,9 @@
 #include <LoRa.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-#include <ArduinoJson.h>
+#include <Arduino_FreeRTOS.h>
+#include <queue.h>
+#include <semphr.h>
 
 // --- Pin Definitions ---
 #define LORA_CS     10
@@ -13,305 +15,205 @@
 #define BTN_GUARDIAN 4
 #define BTN_MONITOR  5
 
-#define LORA_FREQ    868E6  // Frequency (433E6, 868E6, 915E6)
-#define DEBOUNCE_MS  200
+#define LORA_FREQ    868E6
+#define DEBOUNCE_MS  250
 
-#define EMA_ALPHA    0.3f   // Smoothing factor for receiver-side dynamic averages
+struct CommandMessage {
+  char cmd[10];
+  char val[10];
+};
 
-// --- Hardware Objects ---
-LiquidCrystal_I2C lcd(0x27, 16, 2); 
-
-// --- System Telemetry State Structure ---
 struct BaseStationState {
-  // Raw 30-sec window batch averages (from ESP32 transmitter)
   float temp = 0.0;
   float hum = 0.0;
   int voc = 0;
-  unsigned int sampleCount = 0;
-
-  // Local Receiver-side Exponential Moving Averages (EMA)
+  char mode[10] = "MONITOR";
   float emaTemp = 0.0;
   float emaHum = 0.0;
-  float emaVoc = 0.0;
-
-  char mode[10] = "INIT";
-  bool breach = false;
   bool lastDataValid = false;
   unsigned long lastRxTime = 0;
-  int rssi = 0;             // dBm of last received packet
-  float snr = 0.0;          // dB
-  unsigned int packets = 0; // Received since boot
-} baseState;
+};
 
-// --- Button Debounce Tracking ---
-unsigned long lastPressTimePower = 0;
-unsigned long lastPressTimeGuardian = 0;
-unsigned long lastPressTimeMonitor = 0;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+BaseStationState baseState;
 
-// --- Function Declarations ---
-void sendLoRaCommand(const char* action, const char* value);
-void parseIncomingLoRa();
-void updateDisplay();
-void handleButtons();
-void handleSerialCommands();
+QueueHandle_t xTxQueue = NULL;
+SemaphoreHandle_t xStateMutex = NULL;
+
+void vTaskButtons(void *pvParameters);
+void vTaskLoRa(void *pvParameters);
+void vTaskDisplay(void *pvParameters);
 
 void setup() {
   Serial.begin(115200);
 
-  // Initialize Push Buttons with internal pullups
   pinMode(BTN_POWER, INPUT_PULLUP);
   pinMode(BTN_GUARDIAN, INPUT_PULLUP);
   pinMode(BTN_MONITOR, INPUT_PULLUP);
 
-  // Initialize LCD
   lcd.init();
   lcd.backlight();
+  lcd.clear();
   lcd.setCursor(0, 0);
-  lcd.print("Ground Station ");
-  lcd.setCursor(0, 1);
-  lcd.print("Init LoRa...    ");
+  lcd.print(F("Ground Station"));
 
-  // Initialize LoRa Transceiver
   LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
   if (!LoRa.begin(LORA_FREQ)) {
-    Serial.println(F("Error: LoRa initialization failed!"));
     lcd.setCursor(0, 1);
-    lcd.print("LoRa INIT FAIL!");
+    lcd.print(F("LoRa FAIL!"));
     while (1);
   }
 
-  // Radio Configurations
   LoRa.setSpreadingFactor(7);
   LoRa.setSignalBandwidth(125E3);
-  LoRa.setCodingRate4(5);
+  LoRa.setCodingRate4(5); // Must match ESP32 Sync Word
   LoRa.enableCrc();
+  LoRa.receive();
 
-  Serial.println(F("Ground Station initialized successfully."));
-  lcd.setCursor(0, 1);
-  lcd.print("Waiting Base... ");
-  delay(1500);
-  lcd.clear();
+  xTxQueue = xQueueCreate(4, sizeof(CommandMessage));
+  xStateMutex = xSemaphoreCreateMutex();
+
+  xTaskCreate(vTaskButtons, "Btn", 100, NULL, 3, NULL);
+  xTaskCreate(vTaskLoRa,    "LoRa", 240, NULL, 2, NULL);
+  xTaskCreate(vTaskDisplay, "Disp", 160, NULL, 1, NULL);
+
+  vTaskStartScheduler();
 }
 
-void loop() {
-  handleButtons();
-  handleSerialCommands();
-  parseIncomingLoRa();
-  updateDisplay();
-}
+void loop() {}
 
-// --- USB Command Handler -----------------------------------------------------
-void handleSerialCommands() {
-  static char buf[64];
-  static byte len = 0;
+void vTaskButtons(void *pvParameters) {
+  TickType_t xLastPower = 0, xLastGuardian = 0, xLastMonitor = 0;
 
-  while (Serial.available()) {
-    char c = Serial.read();
+  for (;;) {
+    TickType_t xNow = xTaskGetTickCount();
 
-    if (c == '\n' || c == '\r') {
-      if (len == 0) continue;
-      buf[len] = '\0';
-      len = 0;
-
-      StaticJsonDocument<96> doc;
-      if (deserializeJson(doc, buf)) {
-        Serial.println(F("Serial cmd: bad JSON"));
-        continue;
-      }
-
-      const char* cmd = doc["cmd"];
-      const char* val = doc["val"] | "";
-      if (!cmd) {
-        Serial.println(F("Serial cmd: missing 'cmd'"));
-        continue;
-      }
-
-      Serial.print(F("Serial cmd -> "));
-      Serial.print(cmd);
-      Serial.print(' ');
-      Serial.println(val);
-
-      sendLoRaCommand(cmd, val);
+    if (digitalRead(BTN_POWER) == LOW && (xNow - xLastPower > pdMS_TO_TICKS(DEBOUNCE_MS))) {
+      xLastPower = xNow;
+      CommandMessage msg = {"POWER", "TOGGLE"};
+      xQueueSendToBack(xTxQueue, &msg, 0);
     }
-    else if (len < sizeof(buf) - 1) {
-      buf[len++] = c;
+
+    if (digitalRead(BTN_GUARDIAN) == LOW && (xNow - xLastGuardian > pdMS_TO_TICKS(DEBOUNCE_MS))) {
+      xLastGuardian = xNow;
+      CommandMessage msg = {"SET_MODE", "GUARDIAN"};
+      xQueueSendToBack(xTxQueue, &msg, 0);
     }
-    else {
-      len = 0; // Discard overlong lines
+
+    if (digitalRead(BTN_MONITOR) == LOW && (xNow - xLastMonitor > pdMS_TO_TICKS(DEBOUNCE_MS))) {
+      xLastMonitor = xNow;
+      CommandMessage msg = {"SET_MODE", "MONITOR"};
+      xQueueSendToBack(xTxQueue, &msg, 0);
     }
+
+    vTaskDelay(pdMS_TO_TICKS(35));
   }
 }
 
-// --- Button Handler Routine ---
-void handleButtons() {
-  unsigned long now = millis();
+void vTaskLoRa(void *pvParameters) {
+  CommandMessage txMsg;
+  char rxBuffer[128];
 
-  if (digitalRead(BTN_POWER) == LOW) {
-    if (now - lastPressTimePower > DEBOUNCE_MS) {
-      Serial.println(F("BTN: Power Toggle Pressed"));
-      sendLoRaCommand("POWER", "TOGGLE");
-      lastPressTimePower = now;
-    }
-  }
-
-  if (digitalRead(BTN_GUARDIAN) == LOW) {
-    if (now - lastPressTimeGuardian > DEBOUNCE_MS) {
-      Serial.println(F("BTN: Switch to GUARDIAN Pressed"));
-      sendLoRaCommand("SET_MODE", "GUARDIAN");
-      lastPressTimeGuardian = now;
-    }
-  }
-
-  if (digitalRead(BTN_MONITOR) == LOW) {
-    if (now - lastPressTimeMonitor > DEBOUNCE_MS) {
-      Serial.println(F("BTN: Switch to MONITOR Pressed"));
-      sendLoRaCommand("SET_MODE", "MONITOR");
-      lastPressTimeMonitor = now;
-    }
-  }
-}
-
-// --- LoRa Command Dispatcher ---
-void sendLoRaCommand(const char* action, const char* value) {
-  StaticJsonDocument<128> doc;
-  doc["cmd"] = action;
-  doc["val"] = value;
-
-  char buffer[128];
-  size_t len = serializeJson(doc, buffer);
-
-  LoRa.beginPacket();
-  LoRa.write((const uint8_t*)buffer, len);
-  LoRa.endPacket();
-
-  Serial.print(F("LoRa Tx Command: "));
-  Serial.println(buffer);
-
-  lcd.setCursor(14, 0);
-  lcd.print("TX");
-}
-
-// --- Receive & Parse 30-Second Batch Telemetry from ESP32 ---
-void parseIncomingLoRa() {
-  int packetSize = LoRa.parsePacket();
-  if (packetSize > 0) {
-    String payload = "";
-    payload.reserve(packetSize);
-
-    while (LoRa.available()) {
-      payload += (char)LoRa.read();
-    }
-
-    payload.trim();
-
-    if (payload.length() == 0 || payload.charAt(0) != '{') {
-      return; 
-    }
-
-    bool parsed = false;
-    DeserializationError err;
-
-    {
-      StaticJsonDocument<256> doc;
-      err = deserializeJson(doc, payload);
-      if (!err) {
-        baseState.temp        = doc["temp"] | 0.0f;
-        baseState.hum         = doc["hum"] | 0.0f;
-        baseState.voc         = doc["voc"] | 0;
-        baseState.sampleCount = doc["samples"] | 0;
-
-        const char* modeStr = doc["mode"] | "UNKNOWN";
-        strncpy(baseState.mode, modeStr, sizeof(baseState.mode) - 1);
-        baseState.mode[sizeof(baseState.mode) - 1] = '\0';
-
-        baseState.breach = doc["breach"] | false;
-        parsed = true;
-      }
-    }
-
-    if (parsed) {
-      // Calculate receiver moving averages
-      if (!baseState.lastDataValid) {
-        baseState.emaTemp = baseState.temp;
-        baseState.emaHum  = baseState.hum;
-        baseState.emaVoc  = (float)baseState.voc;
-      } else {
-        baseState.emaTemp = (EMA_ALPHA * baseState.temp) + ((1.0f - EMA_ALPHA) * baseState.emaTemp);
-        baseState.emaHum  = (EMA_ALPHA * baseState.hum)  + ((1.0f - EMA_ALPHA) * baseState.emaHum);
-        baseState.emaVoc  = (EMA_ALPHA * (float)baseState.voc) + ((1.0f - EMA_ALPHA) * baseState.emaVoc);
-      }
-
-      baseState.lastDataValid = true;
-      baseState.lastRxTime    = millis();
-      baseState.rssi          = LoRa.packetRssi();
-      baseState.snr           = LoRa.packetSnr();
-      baseState.packets++;
-
-      // Forward combined metrics to dashboard over USB Serial
-      StaticJsonDocument<224> out;
-      out["temp"]     = baseState.temp;
-      out["hum"]      = baseState.hum;
-      out["voc"]      = baseState.voc;
-      out["emaTemp"]  = baseState.emaTemp;
-      out["emaHum"]   = baseState.emaHum;
-      out["samples"]  = baseState.sampleCount;
-      out["mode"]     = baseState.mode;
-      out["breach"]   = baseState.breach;
-      out["rssi"]     = baseState.rssi;
-      out["snr"]      = baseState.snr;
-      out["packets"]  = baseState.packets;
+  for (;;) {
+    // 1. Send Queued Commands
+    if (xQueueReceive(xTxQueue, &txMsg, 0) == pdTRUE) {
+      LoRa.idle();
+      LoRa.beginPacket();
+      LoRa.print(F("{\"cmd\":\""));
+      LoRa.print(txMsg.cmd);
+      LoRa.print(F("\",\"val\":\""));
+      LoRa.print(txMsg.val);
+      LoRa.print(F("\"}"));
+      LoRa.endPacket();
       
-      serializeJson(out, Serial);
-      Serial.println();
-    } else {
-      Serial.print(F("Deserialization failed: "));
-      Serial.println(err.c_str());
+      vTaskDelay(pdMS_TO_TICKS(10));
+      LoRa.receive();
     }
+
+    // 2. Read Packets Safely Into Fixed Static Buffer
+    int packetSize = LoRa.parsePacket();
+    if (packetSize > 0) {
+      int bytesRead = 0;
+      while (LoRa.available() && bytesRead < (sizeof(rxBuffer) - 1)) {
+        rxBuffer[bytesRead++] = (char)LoRa.read();
+      }
+      rxBuffer[bytesRead] = '\0'; // Explicit Null-Termination
+
+      Serial.print(F("[RX RAW] "));
+      Serial.println(rxBuffer);
+
+      // Simple parsing using string search
+      char *tempPtr = strstr(rxBuffer, "\"temp\":");
+      char *humPtr  = strstr(rxBuffer, "\"hum\":");
+      char *modePtr = strstr(rxBuffer, "\"mode\":");
+
+      if (tempPtr != NULL && xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        baseState.temp = atof(tempPtr + 7);
+        if (humPtr != NULL) {
+          baseState.hum = atof(humPtr + 6);
+        }
+
+        if (modePtr != NULL) {
+          char *modeStart = strchr(modePtr + 7, '"');
+          if (modeStart != NULL) {
+            modeStart++;
+            char *modeEnd = strchr(modeStart, '"');
+            if (modeEnd != NULL) {
+              size_t len = modeEnd - modeStart;
+              if (len < sizeof(baseState.mode)) {
+                strncpy(baseState.mode, modeStart, len);
+                baseState.mode[len] = '\0';
+              }
+            }
+          }
+        }
+
+        if (!baseState.lastDataValid) {
+          baseState.emaTemp = baseState.temp;
+          baseState.emaHum  = baseState.hum;
+        } else {
+          baseState.emaTemp = (0.3f * baseState.temp) + (0.7f * baseState.emaHum);
+          baseState.emaHum  = (0.3f * baseState.hum)  + (0.7f * baseState.emaHum);
+        }
+
+        baseState.lastDataValid = true;
+        baseState.lastRxTime = millis();
+        xSemaphoreGive(xStateMutex);
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(40));
   }
 }
 
-// --- Non-Blocking LCD Render Loop ---
-void updateDisplay() {
-  static unsigned long lastLcdUpdate = 0;
-  if (millis() - lastLcdUpdate < 500) return;
-  lastLcdUpdate = millis();
+void vTaskDisplay(void *pvParameters) {
+  for (;;) {
+    if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+      bool offline = (millis() - baseState.lastRxTime > 40000) || !baseState.lastDataValid;
 
-  // Handle offline link condition (e.g. ESP32 Deep Sleep duration exceeds 35s window)
-  bool linkOffline = (millis() - baseState.lastRxTime > 40000) || !baseState.lastDataValid;
+      lcd.setCursor(0, 0);
+      if (offline) {
+        lcd.print(F("LINK: SLEEP/OFF "));
+        lcd.setCursor(0, 1);
+        lcd.print(F("Waiting Node... "));
+      } else {
+        if (baseState.mode[0] == 'G' || baseState.mode[0] == 'O') {
+          lcd.print(F("GARD "));
+        } else {
+          lcd.print(F("INSP "));
+        }
 
-  if (linkOffline) {
-    lcd.setCursor(0, 0);
-    lcd.print("LINK: SLEEP/OFF ");
-    lcd.setCursor(0, 1);
-    lcd.print("Waiting Node... ");
-    return;
+        lcd.print(F("T:"));
+        lcd.print((int)baseState.emaTemp);
+        lcd.print(F("C H:"));
+        lcd.print((int)baseState.emaHum);
+        lcd.print(F("%   "));
+
+        lcd.setCursor(0, 1);
+        lcd.print(F("Status: Active  "));
+      }
+      xSemaphoreGive(xStateMutex);
+    }
+    vTaskDelay(pdMS_TO_TICKS(400));
   }
-
-  char line0[17];
-  char shortMode[5] = "INIT";
-
-  if (strncmp(baseState.mode, "GUARDIAN", 8) == 0 || strncmp(baseState.mode, "OVERRIDE", 8) == 0) {
-    strncpy(shortMode, "GARD", 5);
-  } else if (strncmp(baseState.mode, "MONITOR", 7) == 0 || strncmp(baseState.mode, "INSPECT", 7) == 0) {
-    strncpy(shortMode, "INSP", 5);
-  }
-
-  // Row 0: Operating Mode, Smoothed Temp & Humidity
-  snprintf(line0, sizeof(line0), "%-4s T:%2dC H:%2d%%",
-           shortMode,
-           (int)baseState.emaTemp,
-           (int)baseState.emaHum);
-
-  lcd.setCursor(0, 0);
-  lcd.print(line0);
-
-  // Row 1: VOC metric, breach state, and sample count
-  char line1[17];
-  snprintf(line1, sizeof(line1), "V:%-4d N:%-2u %-5s",
-           (int)baseState.emaVoc,
-           baseState.sampleCount,
-           baseState.breach ? "ALERT" : "OK   ");
-
-  lcd.setCursor(0, 1);
-  lcd.print(line1);
 }
