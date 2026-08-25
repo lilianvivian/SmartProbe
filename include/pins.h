@@ -46,4 +46,9 @@
 #define LORA_RST_PIN    14
 #define LORA_DIO0_PIN   2
 
+// --- Onsite Buttons Pin Mapping ---
+#define INSPECT_BUTTON       48  // Input-only: Requires external pull-down resistor
+#define MODE_BUTTON          47  // Input-only: Requires external pull-down resistor
+#define POWER_BUTTON         9  // Power / Sleep Button
+
 #endif // PINS_H

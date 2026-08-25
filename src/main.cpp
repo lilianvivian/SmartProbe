@@ -11,6 +11,7 @@
 #include <freertos/event_groups.h>
 #include "pins.h"
 #include <nvs_flash.h>
+#include <driver/rtc_io.h>
 
 // --- TinyML TensorFlow Lite Headers ---
 #include "tensorflow/lite/micro/all_ops_resolver.h"
@@ -43,10 +44,14 @@
 #define SLEEP_TIMER_US       (SLEEP_DURATION_SEC * 1000000ULL)
 
 #define TX_INTERVAL_MS       (30 * 1000) // Transmit batch metrics every 30 seconds
-#define EMA_ALPHA           0.2f
+#define EMA_ALPHA            0.2f
 
-#define MAX_SUBSCRIBERS     5
-#define PHONE_LEN           16
+#define MAX_SUBSCRIBERS      5
+#define PHONE_LEN            16
+
+
+// Deep-sleep wakeup mask ONLY for POWER_BUTTON (GPIO 15)
+#define BUTTON_WAKEUP_MASK   (1ULL << POWER_BUTTON)
 
 // --- TinyML Arena ---
 namespace {
@@ -62,6 +67,7 @@ namespace {
 enum SystemCommandType {
   CMD_SET_MODE_INSPECT,
   CMD_SET_MODE_OVERRIDE,
+  CMD_TOGGLE_MODE,
   CMD_TRIGGER_SLEEP
 };
 
@@ -93,6 +99,7 @@ TickType_t xLastActivityTime = 0;
 char subscribers[MAX_SUBSCRIBERS][PHONE_LEN];
 uint8_t subscriberCount = 0;
 
+// --- Helper Functions for GSM NVS Management ---
 void loadSubscribers() {
   preferences.begin("gsm_subs", true);
   subscriberCount = preferences.getUChar("count", 0);
@@ -110,6 +117,37 @@ void loadSubscribers() {
     }
   }
   preferences.end();
+}
+
+bool addSubscriberNVS(const char* newPhone) {
+  if (subscriberCount >= MAX_SUBSCRIBERS) return false;
+
+  for (uint8_t i = 0; i < subscriberCount; i++) {
+    if (strcmp(subscribers[i], newPhone) == 0) return true;
+  }
+
+  preferences.begin("gsm_subs", false);
+  String key = "sub" + String(subscriberCount);
+  preferences.putString(key.c_str(), newPhone);
+  strncpy(subscribers[subscriberCount], newPhone, PHONE_LEN - 1);
+  subscribers[subscriberCount][PHONE_LEN - 1] = '\0';
+  
+  subscriberCount++;
+  preferences.putUChar("count", subscriberCount);
+  preferences.end();
+  
+  Serial.printf("[GSM NVS] Added subscriber #%d: %s\n", subscriberCount, newPhone);
+  return true;
+}
+
+void clearSubscribersNVS() {
+  preferences.begin("gsm_subs", false);
+  preferences.clear();
+  preferences.putUChar("count", 0);
+  preferences.end();
+  
+  subscriberCount = 0;
+  Serial.println(F("[GSM NVS] Cleared all subscriber entries."));
 }
 
 void resetInactivityTimer() {
@@ -170,24 +208,35 @@ void triggerDeepSleep() {
   digitalWrite(BUZZER_PIN, LOW);
   stopActuators();
 
-  // 1. Put LoRa Transceiver into Sleep Mode prior to MCU Deep Sleep
   if (xSpiMutex != NULL && xSemaphoreTake(xSpiMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-    LoRa.receive();
+    LoRa.sleep();
     xSemaphoreGive(xSpiMutex);
   }
 
-  // 2. Configure Wakeup sources (Timer + External DIO0/Button)
+  pinMode(POWER_BUTTON, INPUT_PULLUP);
+  while (digitalRead(POWER_BUTTON) == LOW) {
+    vTaskDelay(pdMS_TO_TICKS(10)); // Block sleep until finger is off the button
+  }
+  vTaskDelay(pdMS_TO_TICKS(100));
+  
+  // 1. Timer Wakeup
   esp_sleep_enable_timer_wakeup(SLEEP_TIMER_US);
   
+  // 2. Radio Signal Wakeup (DIO0)
   #if defined(LORA_DIO0_PIN) && (LORA_DIO0_PIN >= 0)
-  
   gpio_pullup_dis((gpio_num_t)LORA_DIO0_PIN);
   gpio_pulldown_en((gpio_num_t)LORA_DIO0_PIN);
-
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)LORA_DIO0_PIN, 1); // HIGH interrupt from LoRa
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)LORA_DIO0_PIN, 1);
   #endif
 
-  Serial.println(F("[POWER] Radio asleep. Entering Deep Sleep mode..."));
+  // 3. Ext1 Single-Pin Wakeup ONLY for Power Button (Active LOW on GPIO 15)
+  rtc_gpio_pullup_en((gpio_num_t)POWER_BUTTON);
+  rtc_gpio_pulldown_dis((gpio_num_t)POWER_BUTTON);
+
+  // Wake up strictly when POWER_BUTTON (GPIO 15) pulls to GND
+  esp_sleep_enable_ext1_wakeup(BUTTON_WAKEUP_MASK, ESP_EXT1_WAKEUP_ALL_LOW);
+  
+  Serial.println(F("[POWER] Entering Deep Sleep (Waiting ONLY for Power Button on GPIO 15 -> GND)..."));
   Serial.flush();
   esp_deep_sleep_start();
 }
@@ -196,14 +245,47 @@ void checkWakeupReason() {
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
   switch (wakeup_reason) {
     case ESP_SLEEP_WAKEUP_EXT0: 
-      Serial.println(F("[POWER] Wakeup Event: External LoRa Interrupt / Signal")); 
+      Serial.println(F("[POWER] Wakeup Event: LoRa Radio Signal")); 
+      break;
+    case ESP_SLEEP_WAKEUP_EXT1: 
+      Serial.println(F("[POWER] Wakeup Event: Power Button Press (GPIO 15)")); 
       break;
     case ESP_SLEEP_WAKEUP_TIMER: 
       Serial.println(F("[POWER] Wakeup Event: Scheduled Timer Cycle")); 
       break;
     default: 
-      Serial.println(F("[POWER] Cold Boot / Reset")); 
+      Serial.println(F("[POWER] Cold Boot / Hardware Reset")); 
       break;
+  }
+}
+
+// --- Task: 2-Button Polling Task (Internal Pull-Up Active-LOW) ---
+void vTaskButtonHandler(void *pvParameters) {
+  // Use INPUT_PULLUP since buttons connect directly to GND
+  pinMode(MODE_BUTTON,  INPUT_PULLUP); // GPIO 47
+  pinMode(POWER_BUTTON, INPUT_PULLUP); // GPIO 15
+
+  TickType_t lastDebounceTime = 0;
+  const TickType_t debounceDelay = pdMS_TO_TICKS(1500);
+
+  for (;;) {
+    TickType_t now = xTaskGetTickCount();
+
+    if ((now - lastDebounceTime) > debounceDelay) {
+      if (digitalRead(MODE_BUTTON) == LOW) {
+        SystemCommandType sysCmd = CMD_TOGGLE_MODE;
+        xQueueSend(systemCmdQueue, &sysCmd, 0);
+        Serial.println(F("[BUTTON] MODE Toggle Button Pressed (GPIO 47 -> GND)"));
+        lastDebounceTime = now;
+      } 
+      else if (digitalRead(POWER_BUTTON) == LOW) {
+        SystemCommandType sysCmd = CMD_TRIGGER_SLEEP;
+        xQueueSend(systemCmdQueue, &sysCmd, 0);
+        Serial.println(F("[BUTTON] POWER Button Pressed (GPIO 15 -> GND)"));
+        lastDebounceTime = now;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
@@ -231,6 +313,7 @@ void vTaskPowerManagement(void *pvParameters) {
   }
 }
 
+// --- Task: LoRa Communication Engine ---
 void vTaskLoRaEngine(void *pvParameters) {
   Serial.println(F("[LoRa] Re-initializing SPI & LoRa Radio on boot..."));
   
@@ -244,12 +327,11 @@ void vTaskLoRaEngine(void *pvParameters) {
       vTaskDelete(NULL);
     }
 
-    // Restore active operating parameters
     LoRa.setSpreadingFactor(7);
     LoRa.setSignalBandwidth(125E3);
     LoRa.setCodingRate4(5);
     LoRa.enableCrc();
-    LoRa.idle(); // Transition from sleep to standby/active listening
+    LoRa.idle();
     xSemaphoreGive(xSpiMutex);
   }
 
@@ -284,14 +366,26 @@ void vTaskLoRaEngine(void *pvParameters) {
               sysCmd = CMD_SET_MODE_INSPECT;
               xQueueSend(systemCmdQueue, &sysCmd, 0);
             }
-          } else if (strcmp(cmd, "POWER") == 0 && (strcmp(val, "TOGGLE") == 0 || strcmp(val, "OFF") == 0)) {
+          } 
+          else if (strcmp(cmd, "POWER") == 0 && (strcmp(val, "TOGGLE") == 0 || strcmp(val, "OFF") == 0)) {
             SystemCommandType sysCmd = CMD_TRIGGER_SLEEP;
             xQueueSend(systemCmdQueue, &sysCmd, 0);
+          }
+          else if (strcmp(cmd, "GSM_SEND_SMS") == 0 && strlen(val) > 0) {
+            char smsBuf[160];
+            snprintf(smsBuf, sizeof(smsBuf), "[REMOTE LORA] %s", val);
+            xQueueSend(gsmQueue, &smsBuf, 0);
+          }
+          else if (strcmp(cmd, "GSM_ADD_SUB") == 0 && strlen(val) > 0) {
+            addSubscriberNVS(val);
+          }
+          else if (strcmp(cmd, "GSM_CLEAR_SUBS") == 0) {
+            clearSubscribersNVS();
           }
         }
       }
 
-      // 2. Transmit Upstream 30-Second Average Metrics Payload
+      // 2. Transmit Upstream Metrics
       if (latestMetrics.readyToTx) {
         EventBits_t currentBits = xEventGroupGetBits(xSystemEvents);
         bool isOverride = (currentBits & MODE_OVERRIDE_BIT) != 0;
@@ -304,8 +398,9 @@ void vTaskLoRaEngine(void *pvParameters) {
         doc["samples"]  = latestMetrics.sampleCount;
         doc["mode"]     = isOverride ? "OVERRIDE" : (isBreached ? "GUARDIAN" : "MONITOR");
         doc["breach"]   = isBreached;
+        doc["gsm_subs"] = subscriberCount;
 
-        char jsonBuffer[144];
+        char jsonBuffer[160];
         size_t bytesSerialized = serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
 
         LoRa.beginPacket();
@@ -315,7 +410,7 @@ void vTaskLoRaEngine(void *pvParameters) {
         Serial.printf("[LoRa TX] Averaged Payload (%u B): %s | Status: %s\n", 
                       bytesSerialized, jsonBuffer, ok ? "SUCCESS" : "FAILED");
         
-        latestMetrics.readyToTx = false; // Reset transmission flag
+        latestMetrics.readyToTx = false;
       }
 
       xSemaphoreGive(xSpiMutex);
@@ -359,12 +454,10 @@ void vTaskSystemEngine(void *pvParameters) {
   
   SystemCommandType inboundCmd;
 
-  // Real-time Exponential Moving Average Filter states
   static float filteredTemp = -1.0f;
   static float filteredHum  = -1.0f;
   static float filteredVoc  = -1.0f;
 
-  // 30-Second Batch Accumulators
   static double tempSum = 0;
   static double humSum  = 0;
   static double vocSum  = 0;
@@ -377,9 +470,21 @@ void vTaskSystemEngine(void *pvParameters) {
         case CMD_SET_MODE_INSPECT:
           setSystemModeAtomic(MODE_INSPECT_BIT);
           break;
+
         case CMD_SET_MODE_OVERRIDE:
           setSystemModeAtomic(MODE_OVERRIDE_BIT);
           break;
+
+        case CMD_TOGGLE_MODE: {
+          EventBits_t currentBits = xEventGroupGetBits(xSystemEvents);
+          if ((currentBits & MODE_OVERRIDE_BIT) != 0) {
+            setSystemModeAtomic(MODE_INSPECT_BIT);
+          } else {
+            setSystemModeAtomic(MODE_OVERRIDE_BIT);
+          }
+          break;
+        }
+
         case CMD_TRIGGER_SLEEP:
           if (xPowerSleepSemaphore != NULL) xSemaphoreGive(xPowerSleepSemaphore);
           break;
@@ -406,7 +511,6 @@ void vTaskSystemEngine(void *pvParameters) {
       filteredVoc = (filteredVoc < 0.0f) ? (float)rawVoc : (EMA_ALPHA * (float)rawVoc + (1.0f - EMA_ALPHA) * filteredVoc);
     }
 
-    // Accumulate for batch averaging
     if (filteredTemp >= 0.0f && filteredHum >= 0.0f && filteredVoc >= 0.0f) {
       tempSum += filteredTemp;
       humSum  += filteredHum;
@@ -423,9 +527,8 @@ void vTaskSystemEngine(void *pvParameters) {
         latestMetrics.humidity    = (float)(humSum / samplesInWindow);
         latestMetrics.voc         = (int)(vocSum / samplesInWindow);
         latestMetrics.sampleCount = samplesInWindow;
-        latestMetrics.readyToTx   = true; // Flag vTaskLoRaEngine to transmit
+        latestMetrics.readyToTx   = true;
 
-        // Reset accumulation buffers
         tempSum = 0; humSum = 0; vocSum = 0;
         samplesInWindow = 0;
       }
@@ -464,8 +567,11 @@ void vTaskSystemEngine(void *pvParameters) {
       digitalWrite(YELLOW_LED, HIGH);
       digitalWrite(RED_LED, LOW);
       digitalWrite(BUZZER_PIN, HIGH);
-      ledcWrite(PUMP_PWM_CHANNEL, 255);
-      if (FAN_PIN != -1) ledcWrite(FAN_PWM_CHANNEL, 255);
+      if (currentPwmDuty < 255) {
+        currentPwmDuty = (currentPwmDuty + 25 > 255) ? 255 : currentPwmDuty + 25;
+        ledcWrite(PUMP_PWM_CHANNEL, currentPwmDuty);
+        if (FAN_PIN != -1) ledcWrite(FAN_PWM_CHANNEL, currentPwmDuty);
+      }
       smsSentForBreach = false;
 
     } else if (isBreached) {
@@ -542,10 +648,12 @@ void setup() {
   dht.begin();
   initTinyML();
 
-  xTaskCreatePinnedToCore(vTaskPowerManagement, "PowerTask", 3072, NULL, 3, NULL, 0);
-  xTaskCreatePinnedToCore(vTaskSystemEngine, "SystemEngine", 10240, NULL, 2, NULL, 0);
-  xTaskCreatePinnedToCore(vTaskLoRaEngine, "LoRaTask", 8192, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(vTaskGSM, "GSM_Task", 4096, NULL, 1, NULL, 1);
+  // Create Hardware FreeRTOS Tasks
+  xTaskCreatePinnedToCore(vTaskPowerManagement, "PowerTask",    3072,  NULL, 3, NULL, 0);
+  xTaskCreatePinnedToCore(vTaskButtonHandler,    "ButtonTask",   2048,  NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(vTaskSystemEngine,     "SystemEngine", 10240, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(vTaskLoRaEngine,       "LoRaTask",     8192,  NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(vTaskGSM,              "GSM_Task",      4096,  NULL, 1, NULL, 1);
 }
 
 void loop() {
