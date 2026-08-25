@@ -3,9 +3,6 @@
 
 #include <Arduino.h>
 
-// LCD Display (I2C LiquidCrystal)
-#define SDA_PIN             21
-#define SCL_PIN             20
 
 // GSM Module (UART2)
 #define GSM_TX_PIN          17
@@ -26,10 +23,6 @@
 #define PUMP_PIN             5
 #define BUZZER_PIN          18
 
-// Push Buttons
-#define INSPECT_BUTTON      38
-#define MODE_BUTTON         39
-#define POWER_BUTTON        15    // RTC GPIO used for Deep Sleep & Wakeup
 
 // Battery ADC (Disabled to fix pin conflict with GPIO 11)
 #define BATTERY_ADC         -1
@@ -37,13 +30,20 @@
 // Alarm Thresholds & GSM Target
 #define TEMP_THRESHOLD      32.0f  // °C
 #define HUM_THRESHOLD       65.0f  // %
-#define VOC_THRESHOLD       40     // Raw ADC
-#define TARGET_PHONE_NUM    "+254111799290"
+#define VOC_THRESHOLD       1200    // Raw ADC
+#define TARGET_PHONE_NUM    "+254702808564"
 
 // Wi-Fi & MQTT Configuration
-#define WIFI_SSID           "iPHONE"
-#define WIFI_PASS           "12345678"
-#define MQTT_BROKER_IP      "1" // IP of your laptop/server
-#define MQTT_PORT            9001
+#define WIFI_SSID           "Galaxy A126A3D"
+#define WIFI_PASS           "Nasimiyu1200"
+#define MQTT_BROKER_IP      "192.168.40.66" // IP of your laptop/server
+#define MQTT_PORT           1883
+
+#define LORA_SCK_PIN    7
+#define LORA_MISO_PIN   8
+#define LORA_MOSI_PIN   9
+#define LORA_CS_PIN     21
+#define LORA_RST_PIN    13
+#define LORA_DIO0_PIN   14
 
 #endif // PINS_H

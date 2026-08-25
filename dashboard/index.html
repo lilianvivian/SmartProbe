@@ -949,15 +949,15 @@ function renderLink() {
   }
 }
 
-// Mirrors the node's indicator LEDs: monitoring = SAFE, guarding without a
-// breach = WARNING, guarding with a breach = CRITICAL.
-// The node folds breach state into `mode` (OVERRIDE / GUARDIAN / MONITOR), so
-// `breach` is the reliable signal and mode only distinguishes armed from idle.
-function deriveStatus(mode, breach) {
+// Protocol v2 reports `manual` and `breach` as independent booleans, so no
+// inference is needed. v1 folded both into one `mode` string (OVERRIDE when
+// manual, GUARDIAN when breached, MONITOR otherwise) — still handled so a
+// half-flashed pair keeps working.
+function deriveStatus(mode, breach, manual) {
   if (typeof breach !== "boolean") return undefined;
   if (breach) return "CRITICAL";
-  const m = String(mode || "").toUpperCase();
-  return (m === "OVERRIDE") ? "WARNING" : "SAFE";
+  if (typeof manual === "boolean") return manual ? "WARNING" : "SAFE";
+  return String(mode || "").toUpperCase() === "OVERRIDE" ? "WARNING" : "SAFE";
 }
 
 function normalize(raw) {
@@ -979,8 +979,13 @@ function normalize(raw) {
     soundAlarm:         pick(raw, "soundAlarm")
   };
   const breach = pick(raw, "breach");
+  r.manual = pick(raw, "manual");
+  r.ack    = pick(raw, "ack");
   r.gas    = pick(raw, "gas")    ?? gasLevel(r.voc);
-  r.status = pick(raw, "status") ?? deriveStatus(r.mode, breach);
+  r.status = pick(raw, "status") ?? deriveStatus(r.mode, breach, r.manual);
+  // v2 has no `mode` string; synthesise one for the Mode tile.
+  if (r.mode === undefined && typeof r.manual === "boolean")
+    r.mode = r.manual ? "MANUAL" : (breach ? "ALARM" : "AUTO");
   return r;
 }
 
@@ -1026,7 +1031,8 @@ function applyReport(raw) {
   lastPacketAt = Date.now();
   // The node stays awake while armed or breached, so remember which it was —
   // it decides whether later silence means "sleeping" or "link lost".
-  nodeStaysAwake = String(r.mode || "").toUpperCase() === "OVERRIDE"
+  nodeStaysAwake = (r.manual === true)
+                || String(r.mode || "").toUpperCase() === "OVERRIDE"
                 || r.status === "CRITICAL";
   renderLink();
   checkPending(r);
@@ -1133,6 +1139,14 @@ async function readSerialLoop() {
 // The sketch prefixes telemetry with log text ("Rx Telemetry OK: {...}"), so
 // take everything from the first brace rather than requiring a bare JSON line.
 function handleSerialLine(line) {
+  // The ground station reports the sequence number it assigned to a command.
+  // Capturing it lets confirmation key off a real acknowledgement from the node
+  // rather than inferring success from a state change.
+  const tx = line.match(/^\[TX\]\s+\S+\s+seq=(\d+)/);
+  if (tx) {
+    if (pending) pending.seq = Number(tx[1]);
+    return;
+  }
   const i = line.indexOf("{");
   if (i < 0) return;
   try {
@@ -1230,7 +1244,12 @@ function clearPending() {
 // Called from applyReport once each packet is normalized.
 function checkPending(r) {
   if (!pending) return;
-  if (pending.check(r)) {
+  // Prefer the explicit ack; fall back to observing the state change when the
+  // node is still running protocol v1 and sends no ack field.
+  const acked = pending.seq !== undefined
+             && typeof r.ack === "number"
+             && r.ack === pending.seq;
+  if (acked || pending.check(r)) {
     const l = pending.label;
     clearPending();
     actMsg(l + " — confirmed by the node", "ok");
@@ -1376,11 +1395,14 @@ $("srcMqtt").addEventListener("click", () => setSource("mqtt"));
 // and disarming by mode != OVERRIDE — which stays correct during a breach.
 $("btnGuardian").addEventListener("click", () =>
   sendAction("Guardian", "G",
-    (r) => String(r.mode || "").toUpperCase() === "OVERRIDE", "btnGuardian"));
+    (r) => r.manual === true
+        || String(r.mode || "").toUpperCase() === "OVERRIDE", "btnGuardian"));
 
 $("btnMonitor").addEventListener("click", () =>
   sendAction("Monitor", "M",
-    (r) => String(r.mode || "").toUpperCase() !== "OVERRIDE", "btnMonitor"));
+    (r) => r.manual === false
+        || (r.manual === undefined
+            && String(r.mode || "").toUpperCase() !== "OVERRIDE"), "btnMonitor"));
 
 // Sleep has no positive confirmation — the node stops transmitting, so the Link
 // tile is the evidence. Recovery is automatic: the node's only wake source is
