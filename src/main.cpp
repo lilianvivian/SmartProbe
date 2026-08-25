@@ -175,8 +175,15 @@ void vTaskLoRa(void *pvParameters) {
         case CMD_MONITOR:  LoRa.print(F("{\"cmd\":\"SET_MODE\",\"val\":\"MONITOR\"}"));  break;
         case CMD_SLEEP:    LoRa.print(F("{\"cmd\":\"POWER\",\"val\":\"OFF\"}"));         break;
       }
-      LoRa.endPacket();
-      
+      // endPacket() returns 0 if the radio never completed the transmission.
+      // Reporting it separates "the ground station never sent" from "it sent
+      // and the node did not hear it" - otherwise both look identical.
+      bool sent = LoRa.endPacket();
+
+      Serial.print(F("[TX] "));
+      Serial.print(txCode == CMD_GUARDIAN ? 'G' : txCode == CMD_MONITOR ? 'M' : 'P');
+      Serial.println(sent ? F(" ok") : F(" FAILED"));
+
       vTaskDelay(pdMS_TO_TICKS(10));
       LoRa.receive();
     }
