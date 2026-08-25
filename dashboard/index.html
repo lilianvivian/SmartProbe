@@ -1,1429 +1,370 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>SmartProbe — Live Dashboard</title>
-
-<!-- MQTT over WebSockets client -->
-<script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
-
-<style>
-  :root {
-    color-scheme: light;
-    --plane:        #f9f9f7;
-    --surface:      #fcfcfb;
-    --ink:          #0b0b0b;
-    --ink-2:        #52514e;
-    --muted:        #898781;
-    --grid:         #e1e0d9;
-    --baseline:     #c3c2b7;
-    --border:       rgba(11,11,11,0.10);
-
-    /* categorical series (validated slots 1-3) */
-    --temp:  #2a78d6;   /* blue   */
-    --hum:   #eb6834;   /* orange */
-    --voc:   #1baf7a;   /* aqua   */
-    --sig:  #4a3aa7;   /* violet */
-
-    /* status palette (fixed, never themed) */
-    --good:     #0ca30c;
-    --warning:  #fab219;
-    --critical: #d03b3b;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:where(:not([data-theme="light"])) {
-      color-scheme: dark;
-      --plane:    #0d0d0d;
-      --surface:  #1a1a19;
-      --ink:      #ffffff;
-      --ink-2:    #c3c2b7;
-      --muted:    #898781;
-      --grid:     #2c2c2a;
-      --baseline: #383835;
-      --border:   rgba(255,255,255,0.10);
-      --temp: #3987e5;
-      --hum:  #d95926;
-      --voc:  #199e70;
-      --sig: #9085e9;
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LoRa Ground Station Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root {
+      --bg-dark: #0f172a;
+      --panel-bg: #1e293b;
+      --border: #334155;
+      --accent-blue: #38bdf8;
+      --accent-green: #22c55e;
+      --accent-red: #ef4444;
+      --accent-yellow: #eab308;
+      --text-main: #f8fafc;
+      --text-muted: #94a3b8;
     }
-  }
-  :root[data-theme="dark"] {
-    color-scheme: dark;
-    --plane:#0d0d0d; --surface:#1a1a19; --ink:#fff; --ink-2:#c3c2b7;
-    --muted:#898781; --grid:#2c2c2a; --baseline:#383835; --border:rgba(255,255,255,0.10);
-    --temp:#3987e5; --hum:#d95926; --voc:#199e70; --sig:#9085e9;
-  }
 
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    background: var(--plane);
-    color: var(--ink);
-    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-    line-height: 1.4;
-    padding: 20px;
-  }
-  .wrap { max-width: 1040px; margin: 0 auto; }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, sans-serif; }
+    body { background-color: var(--bg-dark); color: var(--text-main); padding: 20px; }
 
-  header {
-    display: flex; flex-wrap: wrap; gap: 12px 20px;
-    align-items: baseline; justify-content: space-between;
-    margin-bottom: 4px;
-  }
-  h1 { font-size: 1.35rem; margin: 0; font-weight: 650; }
-  h1 .probe { color: var(--ink-2); font-weight: 500; }
-  .updated { color: var(--muted); font-size: 0.85rem; }
+    .header {
+      display: flex; justify-content: space-between; align-items: center;
+      padding-bottom: 20px; border-bottom: 1px solid var(--border); margin-bottom: 20px;
+    }
+    .header h1 { font-size: 1.5rem; letter-spacing: 0.5px; }
 
-  /* connection bar */
-  .conn {
-    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 10px; padding: 10px 12px; margin: 14px 0 18px;
-    font-size: 0.85rem;
-  }
-  .conn input {
-    font: inherit; padding: 5px 8px; border: 1px solid var(--border);
-    border-radius: 6px; background: var(--plane); color: var(--ink);
-  }
-  .conn input#broker { flex: 1 1 260px; }
-  .conn input#topic  { flex: 1 1 180px; }
-  /* keep the grouped MQTT inputs in the parent flex flow, not a nested box */
-  #mqttFields { display: contents; }
-  #mqttFields[hidden] { display: none; }
-  .conn button {
-    font: inherit; padding: 6px 14px; border: 0; border-radius: 6px;
-    background: var(--temp); color: #fff; cursor: pointer; font-weight: 600;
-  }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; }
-  .dot.on  { background: var(--good); }
-  .dot.off { background: var(--critical); }
+    /* Controls & WebSerial Connection */
+    .btn {
+      background: #2563eb; color: white; border: none; padding: 8px 16px;
+      border-radius: 6px; cursor: pointer; font-weight: 600; transition: 0.2s;
+    }
+    .btn:hover { background: #1d4ed8; }
+    .btn-danger { background: var(--accent-red); }
+    .btn-danger:hover { background: #dc2626; }
+    .btn-warn { background: var(--accent-yellow); color: #000; }
+    .btn-warn:hover { background: #ca8a04; }
+    .btn-dark { background: #475569; }
+    .btn-dark:hover { background: #334155; }
+    .btn-sm { padding: 4px 8px; font-size: 0.75rem; }
 
-  /* status banner */
-  .banner {
-    display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px;
-    border: 1px solid var(--border); border-left: 6px solid var(--muted);
-    background: var(--surface); border-radius: 12px;
-    padding: 16px 20px; margin-bottom: 18px;
-  }
-  .banner.safe     { border-left-color: var(--good); }
-  .banner.warning  { border-left-color: var(--warning); }
-  .banner.critical { border-left-color: var(--critical); }
-  .banner .icon { font-size: 1.6rem; line-height: 1; }
-  .banner .state { font-size: 1.4rem; font-weight: 700; letter-spacing: 0.01em; }
-  .banner.safe .state     { color: var(--good); }
-  .banner.warning .state  { color: var(--warning); }
-  .banner.critical .state { color: var(--critical); }
-  .banner .detail { color: var(--ink-2); font-size: 0.95rem; }
-  .banner .rec { margin-left: auto; font-weight: 600; }
+    /* Dashboard Grid Layout */
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 20px; }
+    .card { background: var(--panel-bg); border: 1px solid var(--border); border-radius: 8px; padding: 15px; }
+    .card-title { font-size: 0.85rem; color: var(--text-muted); text-transform: uppercase; margin-bottom: 8px; }
+    .card-value { font-size: 1.8rem; font-weight: 700; color: var(--accent-blue); }
 
-  /* actuation controls */
-  .actbar {
-    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px;
-    margin: 0 0 18px;
-  }
-  .actbar .ctl-label { color: var(--muted); font-size: 0.78rem;
-    text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
-  .act {
-    font: inherit; font-size: 0.85rem; font-weight: 600;
-    padding: 7px 16px; border-radius: 8px; cursor: pointer;
-    border: 1px solid var(--border); background: var(--surface); color: var(--ink);
-  }
-  .act:hover:not(:disabled) { border-color: var(--baseline); }
-  .act:disabled { opacity: 0.4; cursor: not-allowed; }
-  .act.danger { color: var(--critical); }
-  .act[data-pending="true"] { opacity: 0.55; }
-  .act-msg { color: var(--muted); font-size: 0.82rem; }
-  .act-msg.ok   { color: var(--good); }
-  .act-msg.fail { color: var(--critical); }
+    /* Badges */
+    .badge {
+      display: inline-block; padding: 4px 8px; border-radius: 4px;
+      font-size: 0.85rem; font-weight: 700; text-transform: uppercase;
+    }
+    .badge-safe { background: rgba(34, 197, 94, 0.2); color: var(--accent-green); border: 1px solid var(--accent-green); }
+    .badge-breach { background: rgba(239, 68, 68, 0.2); color: var(--accent-red); border: 1px solid var(--accent-red); }
 
-  /* stat tiles */
-  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
-  @media (max-width: 720px) { .grid { grid-template-columns: repeat(2, 1fr); } }
-  @media (max-width: 400px) { .grid { grid-template-columns: 1fr; } }
+    /* Layout Columns */
+    .main-content { display: grid; grid-template-columns: 2fr 1fr; gap: 20px; margin-bottom: 20px; }
+    @media (max-width: 1000px) { .main-content { grid-template-columns: 1fr; } }
 
-  .tile {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 12px; padding: 14px 16px;
-  }
-  .tile .label { color: var(--ink-2); font-size: 0.8rem; font-weight: 600;
-    text-transform: uppercase; letter-spacing: 0.04em; }
-  .tile .value { font-size: 2rem; font-weight: 650; margin-top: 2px; }
-  .tile .value .unit { font-size: 0.95rem; color: var(--muted); font-weight: 500; margin-left: 3px; }
-  .tile .sub { color: var(--muted); font-size: 0.8rem; min-height: 1em; }
-  .spark { display: block; width: 100%; height: 40px; margin-top: 8px; overflow: visible; }
-  .spark .hoverval { fill: var(--ink); font-size: 11px; font-weight: 600; }
+    /* Controls Panel */
+    .controls-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 15px; }
+    .input-group { display: flex; gap: 5px; margin-top: 10px; }
+    .input-group input {
+      flex: 1; background: var(--bg-dark); border: 1px solid var(--border);
+      color: white; padding: 8px; border-radius: 6px; outline: none;
+    }
 
-  /* AI / meta row */
-  .meta {
-    display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-top: 14px;
-  }
-  @media (max-width: 720px) { .meta { grid-template-columns: repeat(2, 1fr); } }
-  .meta .tile .value { font-size: 1.25rem; }
+    /* Command Reference Matrix Table */
+    .cmd-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 10px; }
+    .cmd-table th, .cmd-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+    .cmd-table th { color: var(--text-muted); text-transform: uppercase; font-size: 0.75rem; background: rgba(0,0,0,0.2); }
+    .cmd-table code { font-family: monospace; color: var(--accent-blue); background: rgba(56, 189, 248, 0.1); padding: 2px 5px; border-radius: 4px; }
+    .cmd-table .json-preview { font-family: monospace; color: var(--accent-green); font-size: 0.78rem; }
 
-  /* ---- history section ---- */
-  .hist-head {
-    display: flex; flex-wrap: wrap; align-items: baseline;
-    justify-content: space-between; gap: 8px 16px; margin: 26px 0 10px;
-  }
-  h2 { font-size: 1.05rem; margin: 0; font-weight: 650; }
-  .hist-note { color: var(--muted); font-size: 0.8rem; }
-
-  /* one control row, above the content it scopes */
-  .controls {
-    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px;
-    margin-bottom: 12px; font-size: 0.85rem;
-  }
-  .ctl-group { display: flex; align-items: center; gap: 6px; }
-  .ctl-group > .ctl-label { color: var(--muted); font-size: 0.78rem;
-    text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
-  .seg { display: flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-  .seg button {
-    font: inherit; font-size: 0.82rem; padding: 5px 11px; border: 0;
-    background: var(--surface); color: var(--ink-2); cursor: pointer;
-  }
-  .seg button + button { border-left: 1px solid var(--border); }
-  .seg button[aria-pressed="true"] { background: var(--ink); color: var(--plane); font-weight: 600; }
-  .seg button .key {
-    display: inline-block; width: 9px; height: 9px; border-radius: 50%;
-    margin-right: 6px; vertical-align: -1px;
-  }
-  .linkbtn {
-    font: inherit; font-size: 0.82rem; background: none; border: 0;
-    color: var(--ink-2); cursor: pointer; text-decoration: underline;
-    text-underline-offset: 2px; padding: 4px 2px;
-  }
-  .linkbtn:hover { color: var(--critical); }
-
-  .card {
-    position: relative;
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 12px; padding: 14px 16px 10px;
-  }
-  #histChart { display: block; width: 100%; overflow: visible; }
-  #histChart:focus-visible { outline: 2px solid var(--temp); outline-offset: 3px; }
-  .ax { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-  .endlabel { fill: var(--ink); font-size: 12px; font-weight: 650; }
-  .empty { color: var(--muted); font-size: 0.9rem; padding: 40px 4px; text-align: center; }
-
-  /* tooltip */
-  .tip {
-    position: absolute; pointer-events: none; z-index: 5;
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 8px; padding: 8px 10px; min-width: 132px;
-    box-shadow: 0 3px 12px rgba(0,0,0,0.13);
-    font-size: 0.8rem; display: none;
-  }
-  .tip .tip-t { color: var(--muted); font-size: 0.74rem; margin-bottom: 4px;
-    font-variant-numeric: tabular-nums; }
-  .tip .tip-main { font-size: 1.15rem; font-weight: 650; color: var(--ink); line-height: 1.2; }
-  .tip .tip-main .unit { font-size: 0.8rem; color: var(--muted); font-weight: 500; margin-left: 2px; }
-  .tip .tip-name { color: var(--ink-2); font-size: 0.76rem; margin-bottom: 6px; }
-  .tip .tip-row {
-    display: flex; align-items: center; gap: 6px; color: var(--ink-2);
-    font-size: 0.76rem; margin-top: 3px; font-variant-numeric: tabular-nums;
-  }
-  .tip .tip-row .k { display: inline-block; width: 10px; height: 2px; border-radius: 1px; flex: none; }
-  .tip .tip-row .n { color: var(--muted); }
-  .tip .tip-row .v { margin-left: auto; color: var(--ink); }
-
-  /* table view */
-  .tablewrap { overflow-x: auto; max-height: 460px; overflow-y: auto; }
-  table { border-collapse: collapse; width: 100%; font-size: 0.82rem; }
-  th, td { text-align: right; padding: 6px 10px; white-space: nowrap;
-    font-variant-numeric: tabular-nums; }
-  th:first-child, td:first-child { text-align: left; }
-  th:last-child, td:last-child { text-align: left; }
-  thead th {
-    position: sticky; top: 0; background: var(--surface); color: var(--ink-2);
-    font-weight: 600; font-size: 0.76rem;
-    border-bottom: 1px solid var(--baseline);
-  }
-  tbody tr + tr td { border-top: 1px solid var(--grid); }
-  td .st { font-weight: 650; }
-  td .st.SAFE     { color: var(--good); }
-  td .st.WARNING  { color: var(--warning); }
-  td .st.CRITICAL { color: var(--critical); }
-
-  .foot { color: var(--muted); font-size: 0.8rem; margin-top: 22px; text-align: center; }
-  .foot code { background: var(--surface); padding: 1px 5px; border-radius: 4px; border: 1px solid var(--border); }
-
-  @keyframes flash { 0%,100% { background: var(--surface); } 50% { background: rgba(208,59,59,0.14); } }
-  body.alarm { animation: flash 1s ease-in-out 3; }
-</style>
+    /* Terminal Console */
+    .console-out {
+      background: #000; border: 1px solid var(--border); border-radius: 6px;
+      padding: 10px; font-family: monospace; font-size: 0.8rem; height: 160px;
+      overflow-y: auto; color: #4ade80; margin-top: 15px;
+    }
+  </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <h1>SmartProbe <span class="probe" id="probeId">—</span></h1>
-    <div class="updated" id="updated">waiting for data…</div>
-  </header>
 
-  <div class="conn">
-    <span class="dot" id="connDot"></span>
-    <div class="seg" id="sourceSeg" role="group" aria-label="Data source">
-      <button type="button" id="srcSerial" aria-pressed="true">USB Serial</button>
-      <button type="button" id="srcMqtt" aria-pressed="false">MQTT</button>
+  <div class="header">
+    <h1>📡 Ground Station Control Center</h1>
+    <div>
+      <span id="conn-status" class="badge" style="background:#334155; margin-right: 10px;">DISCONNECTED</span>
+      <button id="btn-connect" class="btn">Connect Serial</button>
     </div>
-    <span id="mqttFields" hidden>
-      <label>Broker (WS):</label>
-      <input id="broker" value="ws://broker.hivemq.com:8000/mqtt" spellcheck="false" />
-      <label>Topic:</label>
-      <input id="topic" value="guardian/telemetry" spellcheck="false" />
-    </span>
-    <button id="connectBtn">Connect</button>
-    <span id="connMsg" style="color:var(--muted)"></span>
   </div>
 
-  <div class="banner" id="banner">
-    <span class="icon" id="statusIcon">•</span>
-    <span class="state" id="statusText">NO DATA</span>
-    <span class="detail" id="statusCause"></span>
-    <span class="rec" id="statusRec"></span>
-  </div>
-
-  <div class="actbar">
-    <span class="ctl-label">Control</span>
-    <button class="act" id="btnGuardian" type="button" disabled>Guardian</button>
-    <button class="act" id="btnMonitor"  type="button" disabled>Monitor</button>
-    <button class="act danger" id="btnSleep" type="button" disabled>Sleep</button>
-    <span class="act-msg" id="actMsg"></span>
-  </div>
-
+  <!-- Telemetry Overview Cards -->
   <div class="grid">
-    <div class="tile">
-      <div class="label">Temperature</div>
-      <div class="value"><span id="tempVal">—</span><span class="unit">°C</span></div>
-      <div class="sub" id="tempSub"></div>
-      <svg class="spark" id="tempSpark" preserveAspectRatio="none"></svg>
+    <div class="card">
+      <div class="card-title">Temperature</div>
+      <div class="card-value"><span id="val-temp">--</span> °C</div>
     </div>
-    <div class="tile">
-      <div class="label">Humidity</div>
-      <div class="value"><span id="humVal">—</span><span class="unit">%</span></div>
-      <div class="sub" id="humSub"></div>
-      <svg class="spark" id="humSpark" preserveAspectRatio="none"></svg>
+    <div class="card">
+      <div class="card-title">Humidity</div>
+      <div class="card-value"><span id="val-hum">--</span> %</div>
     </div>
-    <div class="tile">
-      <div class="label">VOC / Gas</div>
-      <div class="value"><span id="vocVal">—</span><span class="unit" id="gasUnit"></span></div>
-      <div class="sub" id="vocSub"></div>
-      <svg class="spark" id="vocSpark" preserveAspectRatio="none"></svg>
+    <div class="card">
+      <div class="card-title">VOC Level</div>
+      <div class="card-value"><span id="val-voc">--</span></div>
     </div>
-    <div class="tile">
-      <div class="label">Signal</div>
-      <div class="value"><span id="sigVal">—</span><span class="unit">dBm</span></div>
-      <div class="sub" id="sigSub"></div>
-      <svg class="spark" id="sigSpark" preserveAspectRatio="none"></svg>
+    <div class="card">
+      <div class="card-title">System Status</div>
+      <div style="margin-top: 5px;">
+        <span id="badge-breach" class="badge badge-safe">NOMINAL</span>
+      </div>
+      <div style="margin-top: 8px; font-size: 0.85rem; color: var(--text-muted);">
+        Mode: <strong id="val-mode" style="color:white;">--</strong> | Subs: <strong id="val-subs" style="color:white;">0</strong>
+      </div>
     </div>
-  </div>
-
-  <div class="meta">
-    <div class="tile"><div class="label">Link</div><div class="value" id="linkVal">—</div></div>
-    <div class="tile"><div class="label">SNR</div><div class="value" id="snrVal">—</div></div>
-    <div class="tile"><div class="label">Packets</div><div class="value" id="pktVal">—</div></div>
-    <div class="tile"><div class="label">Mode / Actuators</div><div class="value" id="modeVal" style="font-size:1rem">—</div></div>
-  </div>
-
-  <div class="hist-head">
-    <h2 id="histTitle">History</h2>
-    <span class="hist-note" id="histNote"></span>
-  </div>
-
-  <div class="controls">
-    <div class="ctl-group">
-      <span class="ctl-label">Metric</span>
-      <div class="seg" id="metricSeg" role="group" aria-label="Metric"></div>
-    </div>
-    <div class="ctl-group">
-      <span class="ctl-label">Range</span>
-      <div class="seg" id="rangeSeg" role="group" aria-label="Time range"></div>
-    </div>
-    <div class="ctl-group">
-      <span class="ctl-label">View</span>
-      <div class="seg" id="viewSeg" role="group" aria-label="View"></div>
-    </div>
-    <button class="linkbtn" id="clearBtn" type="button">Clear stored history</button>
-  </div>
-
-  <div class="card" id="histCard">
-    <svg id="histChart" tabindex="0" role="img" aria-label="Reading history chart"></svg>
-    <div class="tip" id="tip"></div>
-    <div class="empty" id="histEmpty" hidden>
-      No readings stored yet. The chart fills in as messages arrive.
-    </div>
-    <div class="tablewrap" id="histTableWrap" hidden>
-      <table id="histTable">
-        <thead>
-          <tr>
-            <th scope="col">Time</th>
-            <th scope="col">Temp (°C)</th>
-            <th scope="col">Humidity (%)</th>
-            <th scope="col">VOC</th>
-            <th scope="col">RSSI (dBm)</th>
-            <th scope="col">Status</th>
-          </tr>
-        </thead>
-        <tbody id="histTableBody"></tbody>
-      </table>
+    <div class="card">
+      <div class="card-title">LoRa Link Metrics</div>
+      <div style="font-size: 0.95rem; margin-top: 5px;">RSSI: <strong id="val-rssi" style="color:var(--accent-blue)">--</strong> dBm</div>
+      <div style="font-size: 0.95rem; margin-top: 2px;">SNR: <strong id="val-snr" style="color:var(--accent-blue)">--</strong> dB</div>
+      <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">Packets Received: <span id="val-pkts">0</span></div>
     </div>
   </div>
 
-  <div class="foot">
-    Reads the LoRa ground station over USB (Chrome or Edge only). Close the
-    PlatformIO serial monitor first — only one process can hold the port.
-    History is stored in this browser and only while this page is open.
+  <div class="main-content">
+    <!-- Live Telemetry Graph -->
+    <div class="card">
+      <div class="card-title">Real-Time Sensor Trends</div>
+      <div style="position: relative; height: 350px;">
+        <canvas id="telemetryChart"></canvas>
+      </div>
+    </div>
+
+    <!-- Mode Controls & Dynamic Dispatch -->
+    <div class="card">
+      <div class="card-title">System Command Center</div>
+      
+      <div class="controls-grid">
+        <button class="btn btn-dark" onclick="sendCmd('G')" title='Sends {"cmd":"SET_MODE","val":"GUARDIAN"}'>Guardian Mode (G)</button>
+        <button class="btn btn-dark" onclick="sendCmd('M')" title='Sends {"cmd":"SET_MODE","val":"MONITOR"}'>Monitor Mode (M)</button>
+        <button class="btn btn-warn" onclick="sendCmd('T')" title='Sends {"cmd":"SET_MODE","val":"TOGGLE"}'>Toggle Mode (T)</button>
+        <button class="btn btn-danger" onclick="sendCmd('P')" title='Sends {"cmd":"POWER","val":"OFF"}'>Deep Sleep (P)</button>
+      </div>
+
+      <div class="card-title" style="margin-top: 15px;">ESP32 NVS Subscriber Manager</div>
+      <div class="input-group">
+        <input type="text" id="gsm-phone" placeholder="+254712345678" value="+254712345678">
+        <button class="btn" onclick="sendParamCmd('ADD:', 'gsm-phone')">Add Sub</button>
+      </div>
+      <div class="input-group">
+        <input type="text" id="gsm-sms" placeholder="Gas Breach Alert" value="Gas Breach Alert">
+        <button class="btn" onclick="sendParamCmd('SMS:', 'gsm-sms')">Send SMS</button>
+      </div>
+      <button class="btn btn-danger" style="width: 100%; margin-top: 10px;" onclick="sendCmd('C')" title='Sends {"cmd":"GSM_CLEAR_SUBS","val":""}'>Wipe All NVS Subscribers (C)</button>
+
+      <div class="console-out" id="sys-log">-- Serial Console Initialized --<br></div>
+    </div>
   </div>
-</div>
 
-<script>
-"use strict";
+  <!-- Command Reference Matrix -->
+  <div class="card">
+    <div class="card-title">Command Reference Matrix & LoRa Payload Protocol</div>
+    <table class="cmd-table">
+      <thead>
+        <tr>
+          <th>Serial Trigger</th>
+          <th>System Action</th>
+          <th>Outbound LoRa Frame Payload</th>
+          <th>Quick Test</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>G</code></td>
+          <td>Change mode to GUARDIAN</td>
+          <td class="json-preview">{"cmd":"SET_MODE","val":"GUARDIAN"}</td>
+          <td><button class="btn btn-sm btn-dark" onclick="sendCmd('G')">Send</button></td>
+        </tr>
+        <tr>
+          <td><code>M</code></td>
+          <td>Change mode to MONITOR</td>
+          <td class="json-preview">{"cmd":"SET_MODE","val":"MONITOR"}</td>
+          <td><button class="btn btn-sm btn-dark" onclick="sendCmd('M')">Send</button></td>
+        </tr>
+        <tr>
+          <td><code>T</code></td>
+          <td>Toggle System Mode</td>
+          <td class="json-preview">{"cmd":"SET_MODE","val":"TOGGLE"}</td>
+          <td><button class="btn btn-sm btn-warn" onclick="sendCmd('T')">Send</button></td>
+        </tr>
+        <tr>
+          <td><code>P</code></td>
+          <td>Put ESP32 Node into Deep Sleep</td>
+          <td class="json-preview">{"cmd":"POWER","val":"OFF"}</td>
+          <td><button class="btn btn-sm btn-danger" onclick="sendCmd('P')">Send</button></td>
+        </tr>
+        <tr>
+          <td><code>C</code></td>
+          <td>Wipe subscribers list from ESP32 NVS</td>
+          <td class="json-preview">{"cmd":"GSM_CLEAR_SUBS","val":""}</td>
+          <td><button class="btn btn-sm btn-danger" onclick="sendCmd('C')">Send</button></td>
+        </tr>
+        <tr>
+          <td><code>ADD:+254712345678</code></td>
+          <td>Save subscriber to ESP32 NVS</td>
+          <td class="json-preview">{"cmd":"GSM_ADD_SUB","val":"+254712345678"}</td>
+          <td><button class="btn btn-sm" onclick="sendParamCmd('ADD:', 'gsm-phone')">Send</button></td>
+        </tr>
+        <tr>
+          <td><code>SMS:Gas Breach Alert</code></td>
+          <td>Transmit SMS notification alert</td>
+          <td class="json-preview">{"cmd":"GSM_SEND_SMS","val":"Gas Breach Alert"}</td>
+          <td><button class="btn btn-sm" onclick="sendParamCmd('SMS:', 'gsm-sms')">Send</button></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
 
-// ---- storage / retention ----------------------------------------------------
-const STORAGE_KEY  = "smartprobe-history-v1";
-const RETENTION_MS = 24 * 60 * 60 * 1000;  // keep a day
-const MAX_READINGS = 6000;                 // hard guard on array growth
-const SPARK_POINTS = 40;                   // tile sparkline window
+  <script>
+    let port, reader, writer;
+    const decoder = new TextDecoder();
+    let rxBuffer = '';
 
-// Timestamps come from message arrival, not the payload: the firmware sends
-// millis() since boot, which resets on every reset and cannot anchor a time
-// axis. At a 30s sampling interval, network latency is negligible against it.
-const META = {
-  temp: { field: "temperature", label: "Temperature", unit: "°C",  digits: 1, color: "--temp" },
-  hum:  { field: "humidity",    label: "Humidity",    unit: "%",   digits: 1, color: "--hum"  },
-  voc:  { field: "voc",         label: "VOC / Gas",   unit: "",    digits: 0, color: "--voc"  },
-  sig:  { field: "rssi",        label: "Signal",      unit: "dBm", digits: 0, color: "--sig" }
-};
-const KEYS = ["temp", "hum", "voc", "sig"];
-
-const RANGES = [
-  { id: "1h",  label: "1h",  ms: 60 * 60 * 1000 },
-  { id: "6h",  label: "6h",  ms: 6 * 60 * 60 * 1000 },
-  { id: "24h", label: "24h", ms: 24 * 60 * 60 * 1000 }
-];
-
-// each reading: { t, temperature, humidity, voc, rssi, snr, status }
-let readings = [];
-
-let activeMetric = "temp";
-let activeRange  = RANGES[1].ms;   // 6h
-let viewMode     = "chart";        // "chart" | "table"
-
-const $ = (id) => document.getElementById(id);
-const cssVar = (name) =>
-  getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-
-// ---- persistence ------------------------------------------------------------
-function loadHistory() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return;
-    const saved = JSON.parse(raw);
-    if (!Array.isArray(saved)) return;
-    const cutoff = Date.now() - RETENTION_MS;
-    readings = saved.filter((r) => r && typeof r.t === "number" && r.t >= cutoff);
-  } catch (e) {
-    console.warn("history restore failed", e);
-  }
-}
-
-let saveTimer = null;
-function saveHistory() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(readings));
-    } catch (e) {
-      // Over quota — drop the oldest half and try once more.
-      readings = readings.slice(-Math.ceil(readings.length / 2));
-      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(readings)); }
-      catch (e2) { console.warn("history save failed", e2); }
-    }
-  }, 300);
-}
-
-function prune() {
-  const cutoff = Date.now() - RETENTION_MS;
-  let i = 0;
-  while (i < readings.length && readings[i].t < cutoff) i++;
-  if (i) readings.splice(0, i);
-  if (readings.length > MAX_READINGS)
-    readings.splice(0, readings.length - MAX_READINGS);
-}
-
-// ---- small helpers ----------------------------------------------------------
-function num(v, digits) {
-  return (typeof v === "number" && isFinite(v)) ? v.toFixed(digits) : "—";
-}
-function clockTime(ms) {
-  return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
-function fullTime(ms) {
-  return new Date(ms).toLocaleString([], {
-    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit"
-  });
-}
-function svgEl(name, attrs) {
-  const el = document.createElementNS("http://www.w3.org/2000/svg", name);
-  for (const k in attrs) el.setAttribute(k, attrs[k]);
-  return el;
-}
-
-// Axis ticks on clean numbers (1 / 2 / 2.5 / 5 x 10^n).
-function niceTicks(min, max, target) {
-  if (!(isFinite(min) && isFinite(max))) return [];
-  if (min === max) { min -= 1; max += 1; }
-  const raw = (max - min) / Math.max(1, target);
-  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
-  const norm = raw / mag;
-  const step = (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 2.5 ? 2.5 : norm <= 5 ? 5 : 10) * mag;
-  const out = [];
-  for (let v = Math.ceil(min / step) * step; v <= max + step * 1e-9; v += step)
-    out.push(Math.round(v / step) * step);
-  return out;
-}
-
-// A straight line across a long gap would invent readings that were never
-// taken — and this probe drops samples whenever WiFi is down. Break instead.
-function gapThreshold(pts) {
-  if (pts.length < 3) return Infinity;
-  const deltas = [];
-  for (let i = 1; i < pts.length; i++) deltas.push(pts[i].t - pts[i - 1].t);
-  deltas.sort((a, b) => a - b);
-  const median = deltas[Math.floor(deltas.length / 2)];
-  return Math.max(median * 3, 15000);
-}
-
-// ---- tile sparklines --------------------------------------------------------
-function drawSpark(svgId, key) {
-  const svg = $(svgId);
-  const field = META[key].field;
-  const data = readings.slice(-SPARK_POINTS)
-    .map((r) => r[field])
-    .filter((v) => typeof v === "number" && isFinite(v));
-
-  const w = svg.clientWidth || 200;
-  const h = svg.clientHeight || 40;
-  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
-  while (svg.firstChild) svg.removeChild(svg.firstChild);
-  if (data.length < 2) return;
-
-  let min = Math.min(...data), max = Math.max(...data);
-  if (min === max) { min -= 1; max += 1; }
-  const pad = 4;
-  const x = (i) => pad + (i / (data.length - 1)) * (w - 2 * pad);
-  const y = (v) => (h - pad) - ((v - min) / (max - min)) * (h - 2 * pad);
-  const color = cssVar(META[key].color);
-
-  const pts = data.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
-  svg.appendChild(svgEl("polyline", {
-    points: pts, fill: "none", stroke: color, "stroke-width": "2",
-    "stroke-linecap": "round", "stroke-linejoin": "round"
-  }));
-
-  const last = data.length - 1;
-  svg.appendChild(svgEl("circle", {
-    cx: x(last).toFixed(1), cy: y(data[last]).toFixed(1), r: "2.6", fill: color
-  }));
-
-  const hoverDot = svgEl("circle", { r: "3", fill: color });
-  hoverDot.style.display = "none";
-  const hoverTxt = svgEl("text", { class: "hoverval" });
-  hoverTxt.style.display = "none";
-  svg.appendChild(hoverDot); svg.appendChild(hoverTxt);
-
-  svg.onmousemove = (e) => {
-    const rect = svg.getBoundingClientRect();
-    const rel = (e.clientX - rect.left) / rect.width * w;
-    let i = Math.round((rel - pad) / (w - 2 * pad) * (data.length - 1));
-    i = Math.max(0, Math.min(data.length - 1, i));
-    hoverDot.setAttribute("cx", x(i).toFixed(1));
-    hoverDot.setAttribute("cy", y(data[i]).toFixed(1));
-    hoverDot.style.display = "";
-    hoverTxt.textContent = (Math.round(data[i] * 10) / 10).toString();
-    hoverTxt.setAttribute("x", Math.min(w - 24, x(i) + 4).toFixed(1));
-    hoverTxt.setAttribute("y", Math.max(11, y(data[i]) - 5).toFixed(1));
-    hoverTxt.style.display = "";
-  };
-  svg.onmouseleave = () => { hoverDot.style.display = "none"; hoverTxt.style.display = "none"; };
-}
-
-function redrawSparks() {
-  drawSpark("tempSpark", "temp");
-  drawSpark("humSpark", "hum");
-  drawSpark("vocSpark", "voc");
-  drawSpark("sigSpark", "sig");
-}
-
-// ---- history chart ----------------------------------------------------------
-const M = { top: 14, right: 66, bottom: 30, left: 54 };
-const PLOT_H = 240;
-
-let hoverIndex = -1;
-let plotGeom = null;   // { pts, x, y, left, right, top, bottom }
-
-function visibleReadings() {
-  const field = META[activeMetric].field;
-  const cutoff = Date.now() - activeRange;
-  return readings.filter(
-    (r) => r.t >= cutoff && typeof r[field] === "number" && isFinite(r[field])
-  );
-}
-
-function renderChart() {
-  const svg = $("histChart");
-  const meta = META[activeMetric];
-  const card = $("histCard");
-  while (svg.firstChild) svg.removeChild(svg.firstChild);
-
-  const data = visibleReadings();
-  const w = Math.max(320, card.clientWidth - 32);
-  const h = M.top + PLOT_H + M.bottom;
-  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
-  svg.setAttribute("height", h);
-  svg.setAttribute("aria-label",
-    `${meta.label} over the last ${currentRangeLabel()} — ${data.length} readings`);
-
-  // `hidden` is an HTMLElement IDL attribute; on an <svg> it silently does
-  // nothing, so visibility here is driven by style.
-  if (data.length < 2) {
-    plotGeom = null;
-    svg.style.display = "none";
-    $("histEmpty").hidden = false;
-    return;
-  }
-  svg.style.display = "block";
-  $("histEmpty").hidden = true;
-
-  const field = meta.field;
-  const color = cssVar(meta.color);
-  const now = Date.now();
-  const t0 = now - activeRange;
-
-  const values = data.map((r) => r[field]);
-  let lo = Math.min(...values), hi = Math.max(...values);
-  if (lo === hi) { lo -= 1; hi += 1; }
-  const padY = (hi - lo) * 0.12;
-  lo -= padY; hi += padY;
-
-  const left = M.left, right = w - M.right, top = M.top, bottom = M.top + PLOT_H;
-  const x = (t) => left + ((t - t0) / (now - t0)) * (right - left);
-  const y = (v) => bottom - ((v - lo) / (hi - lo)) * (bottom - top);
-
-  // gridlines + y ticks (solid hairlines, recessive)
-  const gridColor = cssVar("--grid");
-  niceTicks(lo, hi, 5).forEach((v) => {
-    if (v < lo || v > hi) return;
-    const yy = y(v);
-    svg.appendChild(svgEl("line", {
-      x1: left, y1: yy.toFixed(1), x2: right, y2: yy.toFixed(1),
-      stroke: gridColor, "stroke-width": "1"
-    }));
-    const lbl = svgEl("text", {
-      class: "ax", x: left - 8, y: (yy + 4).toFixed(1), "text-anchor": "end"
-    });
-    lbl.textContent = v.toFixed(meta.digits);
-    svg.appendChild(lbl);
-  });
-
-  // baseline + x ticks
-  svg.appendChild(svgEl("line", {
-    x1: left, y1: bottom, x2: right, y2: bottom,
-    stroke: cssVar("--baseline"), "stroke-width": "1"
-  }));
-  const tickCount = w < 560 ? 3 : 5;
-  for (let i = 0; i <= tickCount; i++) {
-    const t = t0 + (i / tickCount) * (now - t0);
-    const lbl = svgEl("text", {
-      class: "ax", x: x(t).toFixed(1), y: bottom + 18,
-      "text-anchor": i === 0 ? "start" : i === tickCount ? "end" : "middle"
-    });
-    lbl.textContent = clockTime(t);
-    svg.appendChild(lbl);
-  }
-
-  // area wash + line, split on gaps so missing samples are not interpolated
-  const limit = gapThreshold(data);
-  const segments = [];
-  let run = [data[0]];
-  for (let i = 1; i < data.length; i++) {
-    if (data[i].t - data[i - 1].t > limit) { segments.push(run); run = []; }
-    run.push(data[i]);
-  }
-  segments.push(run);
-
-  segments.forEach((seg) => {
-    if (seg.length < 2) {
-      if (seg.length === 1) {
-        svg.appendChild(svgEl("circle", {
-          cx: x(seg[0].t).toFixed(1), cy: y(seg[0][field]).toFixed(1),
-          r: "2.5", fill: color
-        }));
+    // --- CHART INITIALIZATION ---
+    const ctx = document.getElementById('telemetryChart').getContext('2d');
+    const telemetryChart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: [],
+        datasets: [
+          { label: 'Temp (°C)', borderColor: '#ef4444', data: [], tension: 0.3, fill: false },
+          { label: 'Humidity (%)', borderColor: '#38bdf8', data: [], tension: 0.3, fill: false },
+          { label: 'VOC Index', borderColor: '#eab308', data: [], tension: 0.3, fill: false }
+        ]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          x: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } },
+          y: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' } }
+        },
+        plugins: { legend: { labels: { color: '#f8fafc' } } }
       }
-      return;
-    }
-    const line = seg.map((r) => `${x(r.t).toFixed(1)},${y(r[field]).toFixed(1)}`).join(" L ");
-    svg.appendChild(svgEl("path", {
-      d: `M ${x(seg[0].t).toFixed(1)},${bottom} L ${line} L ${x(seg[seg.length - 1].t).toFixed(1)},${bottom} Z`,
-      fill: color, "fill-opacity": "0.10", stroke: "none"
-    }));
-    svg.appendChild(svgEl("path", {
-      d: `M ${line}`, fill: "none", stroke: color, "stroke-width": "2",
-      "stroke-linecap": "round", "stroke-linejoin": "round"
-    }));
-  });
-
-  // end marker with a 2px surface ring, plus the one direct label
-  const lastPt = data[data.length - 1];
-  svg.appendChild(svgEl("circle", {
-    cx: x(lastPt.t).toFixed(1), cy: y(lastPt[field]).toFixed(1), r: "4.5",
-    fill: color, stroke: cssVar("--surface"), "stroke-width": "2"
-  }));
-  const endLbl = svgEl("text", {
-    class: "endlabel", x: (x(lastPt.t) + 10).toFixed(1),
-    y: (y(lastPt[field]) + 4).toFixed(1)
-  });
-  endLbl.textContent = num(lastPt[field], meta.digits) + (meta.unit ? " " + meta.unit : "");
-  svg.appendChild(endLbl);
-
-  // crosshair layer (hidden until hover/focus)
-  const cross = svgEl("line", {
-    id: "crossLine", y1: top, y2: bottom, stroke: cssVar("--baseline"), "stroke-width": "1"
-  });
-  cross.style.display = "none";
-  const crossDot = svgEl("circle", {
-    id: "crossDot", r: "5", fill: color, stroke: cssVar("--surface"), "stroke-width": "2"
-  });
-  crossDot.style.display = "none";
-  svg.appendChild(cross); svg.appendChild(crossDot);
-
-  plotGeom = { pts: data, x, y, left, right, top, bottom, field, color, w };
-  if (hoverIndex >= data.length) hoverIndex = -1;
-  if (hoverIndex >= 0) showHover(hoverIndex); else hideHover();
-}
-
-function currentRangeLabel() {
-  const r = RANGES.find((r) => r.ms === activeRange);
-  return r ? r.label : "";
-}
-
-// ---- hover / keyboard readout ----------------------------------------------
-function showHover(i) {
-  if (!plotGeom) return;
-  const { pts, x, y, top, bottom, field, w } = plotGeom;
-  i = Math.max(0, Math.min(pts.length - 1, i));
-  hoverIndex = i;
-  const r = pts[i];
-
-  const cross = $("crossLine"), dot = $("crossDot");
-  if (cross) {
-    cross.setAttribute("x1", x(r.t).toFixed(1));
-    cross.setAttribute("x2", x(r.t).toFixed(1));
-    cross.style.display = "";
-  }
-  if (dot) {
-    dot.setAttribute("cx", x(r.t).toFixed(1));
-    dot.setAttribute("cy", y(r[field]).toFixed(1));
-    dot.style.display = "";
-  }
-
-  // Values lead, labels follow. Every field is text-inserted, never innerHTML.
-  const tip = $("tip");
-  while (tip.firstChild) tip.removeChild(tip.firstChild);
-
-  const when = document.createElement("div");
-  when.className = "tip-t";
-  when.textContent = fullTime(r.t);
-  tip.appendChild(when);
-
-  const meta = META[activeMetric];
-  const main = document.createElement("div");
-  main.className = "tip-main";
-  main.textContent = num(r[field], meta.digits);
-  if (meta.unit) {
-    const u = document.createElement("span");
-    u.className = "unit";
-    u.textContent = meta.unit;
-    main.appendChild(u);
-  }
-  tip.appendChild(main);
-
-  const name = document.createElement("div");
-  name.className = "tip-name";
-  name.textContent = meta.label;
-  tip.appendChild(name);
-
-  KEYS.filter((k) => k !== activeMetric).forEach((k) => {
-    const m = META[k];
-    const row = document.createElement("div");
-    row.className = "tip-row";
-    const key = document.createElement("span");
-    key.className = "k";
-    key.style.background = cssVar(m.color);
-    const nm = document.createElement("span");
-    nm.className = "n";
-    nm.textContent = m.label;
-    const val = document.createElement("span");
-    val.className = "v";
-    val.textContent = num(r[m.field], m.digits) + (m.unit ? " " + m.unit : "");
-    row.appendChild(key); row.appendChild(nm); row.appendChild(val);
-    tip.appendChild(row);
-  });
-
-  const svg = $("histChart");
-  const scale = svg.getBoundingClientRect().width / w;
-  tip.style.display = "block";
-  const tipW = tip.offsetWidth;
-  let px = x(r.t) * scale + 14;
-  if (px + tipW > svg.getBoundingClientRect().width) px = x(r.t) * scale - tipW - 14;
-  tip.style.left = Math.max(0, px) + 16 + "px";
-  tip.style.top = Math.max(8, y(r[field]) * scale - 10) + 14 + "px";
-}
-
-function hideHover() {
-  hoverIndex = -1;
-  const cross = $("crossLine"), dot = $("crossDot");
-  if (cross) cross.style.display = "none";
-  if (dot) dot.style.display = "none";
-  $("tip").style.display = "none";
-}
-
-function nearestIndex(clientX) {
-  if (!plotGeom) return -1;
-  const svg = $("histChart");
-  const rect = svg.getBoundingClientRect();
-  const rel = (clientX - rect.left) / rect.width * plotGeom.w;
-  let best = 0, bestD = Infinity;
-  plotGeom.pts.forEach((r, i) => {
-    const d = Math.abs(plotGeom.x(r.t) - rel);
-    if (d < bestD) { bestD = d; best = i; }
-  });
-  return best;
-}
-
-// ---- table view (the chart's accessible twin) -------------------------------
-function renderTable() {
-  const body = $("histTableBody");
-  while (body.firstChild) body.removeChild(body.firstChild);
-
-  const cutoff = Date.now() - activeRange;
-  const rows = readings.filter((r) => r.t >= cutoff).slice().reverse();
-
-  rows.forEach((r) => {
-    const tr = document.createElement("tr");
-    const cells = [
-      fullTime(r.t),
-      num(r.temperature, 1),
-      num(r.humidity, 1),
-      num(r.voc, 0),
-      num(r.rssi, 0)
-    ];
-    cells.forEach((text) => {
-      const td = document.createElement("td");
-      td.textContent = text;
-      tr.appendChild(td);
     });
-    const tdSt = document.createElement("td");
-    const span = document.createElement("span");
-    span.className = "st " + (r.status || "");
-    span.textContent = r.status || "—";
-    tdSt.appendChild(span);
-    tr.appendChild(tdSt);
-    body.appendChild(tr);
-  });
-}
 
-// ---- view orchestration -----------------------------------------------------
-function renderHistory() {
-  prune();
-  const meta = META[activeMetric];
-  // the table carries every metric, so naming one in the title would misdescribe it
-  $("histTitle").textContent =
-    viewMode === "table" ? "Reading history" : meta.label + " history";
+    // --- WEBSERIAL CONNECTION MANAGEMENT ---
+    document.getElementById('btn-connect').addEventListener('click', async () => {
+      if ('serial' in navigator) {
+        try {
+          port = await navigator.serial.requestPort();
+          await port.open({ baudRate: 115200 });
 
-  const cutoff = Date.now() - activeRange;
-  const inRange = readings.filter((r) => r.t >= cutoff).length;
-  $("histNote").textContent = inRange
-    ? `${inRange} reading${inRange === 1 ? "" : "s"} in the last ${currentRangeLabel()} · ${readings.length} stored`
-    : `no readings in the last ${currentRangeLabel()} · ${readings.length} stored`;
+          const textEncoder = new TextEncoderStream();
+          textEncoder.readable.pipeTo(port.writable);
+          writer = textEncoder.writable.getWriter();
 
-  const chartMode = viewMode === "chart";
-  $("histTableWrap").hidden = chartMode;
-  $("tip").style.display = "none";
+          document.getElementById('conn-status').textContent = 'CONNECTED';
+          document.getElementById('conn-status').className = 'badge badge-safe';
+          logConsole('Connected to Base Station at 115200 Baud');
 
-  if (chartMode) {
-    renderChart();
-  } else {
-    $("histChart").style.display = "none";
-    $("histEmpty").hidden = readings.length > 0;
-    renderTable();
-  }
-}
-
-// ---- apply one telemetry message to the UI ----------------------------------
-const STATUS = {
-  SAFE:     { cls: "safe",     icon: "✓" },
-  WARNING:  { cls: "warning",  icon: "⚠" },
-  CRITICAL: { cls: "critical", icon: "✕" }
-};
-
-// The LoRa link uses short keys to keep packets small, and the ground station
-// forwards them verbatim. Long-form keys from the MQTT/ESP32 path are accepted
-// as a fallback so one dashboard serves either source.
-function pick(raw, ...keys) {
-  for (const k of keys)
-    if (raw[k] !== undefined && raw[k] !== null) return raw[k];
-  return undefined;
-}
-
-function gasLevel(voc) {
-  if (typeof voc !== "number" || !isFinite(voc)) return undefined;
-  return voc < 250 ? "LOW" : voc < 400 ? "MEDIUM" : "HIGH";
-}
-
-// Rough LoRa RSSI bands. Below about -120 dBm you are at the noise floor.
-function rssiQuality(rssi) {
-  if (typeof rssi !== "number" || !isFinite(rssi)) return "";
-  if (rssi > -80)  return "excellent";
-  if (rssi > -100) return "good";
-  if (rssi > -115) return "weak";
-  return "marginal";
-}
-
-// The node sleeps on an inactivity timeout, not a fixed cycle: after
-// AWAKE_INTERVAL_SEC (2 min) of quiet it deep-sleeps for SLEEP_DURATION_SEC
-// (3 min) — but ONLY when idle. It refuses to sleep while armed (OVERRIDE) or
-// breached. So silence is expected when idle and suspicious when armed.
-const NODE_SLEEP_S  = 180;
-const LINK_LIVE_MS  = 10000;                      // telemetry arrives every 2s
-const LINK_LOST_MS  = (NODE_SLEEP_S + 60) * 1000; // a full sleep plus margin
-let lastPacketAt = 0;
-let nodeStaysAwake = false;   // armed or breached at last contact
-
-function fmtAge(ms) {
-  const s = Math.round(ms / 1000);
-  if (s < 60) return s + "s";
-  const m = Math.floor(s / 60);
-  return m + "m" + (s % 60 ? " " + (s % 60) + "s" : "");
-}
-
-function renderLink() {
-  const el = $("linkVal");
-  if (!lastPacketAt) {
-    el.textContent = "—";
-    el.style.color = "";
-    el.title = "";
-    return;
-  }
-  const age = Date.now() - lastPacketAt;
-
-  if (age < LINK_LIVE_MS) {
-    el.textContent = "live";
-    el.style.color = "var(--good)";
-    el.title = "Receiving telemetry.";
-  } else if (pending) {
-    // A command is in flight, so nodeStaysAwake reflects the state we just
-    // asked the node to leave. Claiming "sleeping" or "NO SIGNAL" off that
-    // stale reading is worse than admitting we don't know yet.
-    el.textContent = "changing " + fmtAge(age);
-    el.style.color = "var(--muted)";
-    el.title = "A command is in flight — the node's state is unknown until the "
-             + "next packet arrives.";
-  } else if (nodeStaysAwake) {
-    // Armed or breached at last contact, so the node should not be sleeping.
-    el.textContent = "NO SIGNAL " + fmtAge(age);
-    el.style.color = "var(--critical)";
-    el.title = "The node was armed or breached at last contact, and in that "
-             + "state it refuses to sleep — so this silence is a lost link, "
-             + "not a power-saving nap.";
-  } else if (age < LINK_LOST_MS) {
-    el.textContent = "sleeping " + fmtAge(age);
-    el.style.color = "var(--warning)";
-    el.title = "No telemetry, but the node was idle and disarmed, so it has "
-             + "likely deep-slept after its 2 min inactivity timeout. It wakes "
-             + "itself about 3 min later.";
-  } else {
-    el.textContent = "OFFLINE " + fmtAge(age);
-    el.style.color = "var(--critical)";
-    el.title = "Silent for longer than a full sleep cycle — the link is "
-             + "probably genuinely lost.";
-  }
-}
-
-// Mirrors the node's indicator LEDs: monitoring = SAFE, guarding without a
-// breach = WARNING, guarding with a breach = CRITICAL.
-// The node folds breach state into `mode` (OVERRIDE / GUARDIAN / MONITOR), so
-// `breach` is the reliable signal and mode only distinguishes armed from idle.
-function deriveStatus(mode, breach) {
-  if (typeof breach !== "boolean") return undefined;
-  if (breach) return "CRITICAL";
-  const m = String(mode || "").toUpperCase();
-  return (m === "OVERRIDE") ? "WARNING" : "SAFE";
-}
-
-function normalize(raw) {
-  const r = {
-    id:                 pick(raw, "id"),
-    temperature:        pick(raw, "temp", "temperature"),
-    humidity:           pick(raw, "hum", "humidity"),
-    voc:                pick(raw, "voc"),
-    rssi:               pick(raw, "rssi"),
-    snr:                pick(raw, "snr"),
-    packets:            pick(raw, "packets"),
-    mode:               pick(raw, "mode"),
-    cause:              pick(raw, "cause"),
-    recommendation:     pick(raw, "recommendation"),
-    trend:              pick(raw, "trend"),
-    nextInspectionDays: pick(raw, "nextInspectionDays"),
-    confidence:         pick(raw, "confidence"),
-    runFan:             pick(raw, "runFan"),
-    soundAlarm:         pick(raw, "soundAlarm")
-  };
-  const breach = pick(raw, "breach");
-  r.gas    = pick(raw, "gas")    ?? gasLevel(r.voc);
-  r.status = pick(raw, "status") ?? deriveStatus(r.mode, breach);
-  return r;
-}
-
-function applyReport(raw) {
-  const r = normalize(raw);
-  if (r.id) $("probeId").textContent = r.id;
-  $("updated").textContent = "updated " + new Date().toLocaleTimeString();
-
-  $("tempVal").textContent = num(r.temperature, 1);
-  $("humVal").textContent  = num(r.humidity, 0);
-  $("vocVal").textContent  = num(r.voc, 0);
-  $("sigVal").textContent  = num(r.rssi, 0);
-  $("sigSub").textContent  = rssiQuality(r.rssi);
-  $("gasUnit").textContent = r.gas ? r.gas : "";
-  $("vocSub").textContent  = r.gas ? ("gas level: " + r.gas) : "";
-
-  $("snrVal").textContent  = (typeof r.snr === "number") ? r.snr.toFixed(1) + " dB" : "—";
-  $("pktVal").textContent  = (typeof r.packets === "number") ? String(r.packets) : "—";
-
-  readings.push({
-    t: Date.now(),
-    temperature: r.temperature,
-    humidity: r.humidity,
-    voc: r.voc,
-    rssi: r.rssi,
-    snr: r.snr,
-    status: r.status
-  });
-  prune();
-  saveHistory();
-
-  redrawSparks();
-  renderHistory();
-
-  const banner = $("banner");
-  const s = STATUS[r.status] || { cls: "", icon: "•" };
-  banner.className = "banner " + s.cls;
-  $("statusIcon").textContent = s.icon;
-  $("statusText").textContent = r.status || "—";
-  $("statusCause").textContent = (r.cause && r.cause !== "NONE") ? ("Cause: " + r.cause) : "";
-  $("statusRec").textContent = r.recommendation || "";
-
-  lastPacketAt = Date.now();
-  // The node stays awake while armed or breached, so remember which it was —
-  // it decides whether later silence means "sleeping" or "link lost".
-  nodeStaysAwake = String(r.mode || "").toUpperCase() === "OVERRIDE"
-                || r.status === "CRITICAL";
-  renderLink();
-  checkPending(r);
-
-  // Only state actuator status when the payload actually carries it — the LoRa
-  // node sends neither field, and "fan off" would be an unfounded claim.
-  $("modeVal").textContent =
-    (r.mode || "—") +
-    (typeof r.runFan === "boolean" ? (r.runFan ? " · fan ON" : " · fan off") : "") +
-    (r.soundAlarm ? " · ALARM" : "");
-
-  if (r.status === "CRITICAL") criticalAlert();
-}
-
-let lastAlert = 0;
-function criticalAlert() {
-  const now = Date.now();
-  if (now - lastAlert < 15000) return;
-  lastAlert = now;
-  document.body.classList.remove("alarm");
-  void document.body.offsetWidth;
-  document.body.classList.add("alarm");
-  try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    const o = ctx.createOscillator(), g = ctx.createGain();
-    o.type = "square"; o.frequency.value = 880;
-    o.connect(g); g.connect(ctx.destination);
-    g.gain.setValueAtTime(0.05, ctx.currentTime);
-    o.start(); o.stop(ctx.currentTime + 0.25);
-  } catch (e) { /* audio may be blocked before user interaction */ }
-}
-
-// ---- connection -------------------------------------------------------------
-let client = null;
-let source = "serial";          // "serial" | "mqtt"
-
-function setConn(state, msg) {
-  const dot = $("connDot");
-  dot.className = "dot " + (state === "on" ? "on" : state === "off" ? "off" : "");
-  $("connMsg").textContent = msg || "";
-}
-
-// ---- USB serial (Web Serial API) --------------------------------------------
-// The ground station is an Uno with no WiFi, so telemetry arrives over the same
-// USB cable used to flash it. Chromium only - Firefox and Safari ship no
-// equivalent. Note the port can only be held by one process: close the
-// PlatformIO serial monitor first.
-let port = null, keepReading = false;
-
-async function connectSerial() {
-  if (!("serial" in navigator)) {
-    setConn("off", "Web Serial unsupported — use Chrome or Edge");
-    return;
-  }
-  try {
-    await disconnectSerial();
-    port = await navigator.serial.requestPort();
-    await port.open({ baudRate: 115200 });
-    setConn("on", "serial connected");
-    refreshControls();
-    keepReading = true;
-    readSerialLoop();
-  } catch (e) {
-    // requestPort() throws if the picker is dismissed — not worth alarming over
-    setConn("off", e && e.name === "NotFoundError" ? "no port selected" : "serial: " + e.message);
-  }
-}
-
-async function disconnectSerial() {
-  keepReading = false;
-  if (port) {
-    try { await port.close(); } catch (e) { /* already closed */ }
-    port = null;
-  }
-  clearPending();
-  refreshControls();
-}
-
-async function readSerialLoop() {
-  const decoder = new TextDecoderStream();
-  const piped = port.readable.pipeTo(decoder.writable).catch(() => {});
-  const reader = decoder.readable.getReader();
-  let buf = "";
-  try {
-    while (keepReading) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += value;
-      let nl;
-      while ((nl = buf.indexOf("\n")) >= 0) {
-        handleSerialLine(buf.slice(0, nl));
-        buf = buf.slice(nl + 1);
+          readSerialStream();
+        } catch (err) {
+          logConsole('Connection Error: ' + err.message);
+        }
+      } else {
+        alert('Web Serial API is not supported in your browser. Please use Chrome, Edge, or Opera.');
       }
-      if (buf.length > 4096) buf = "";   // never grow without bound on junk
-    }
-  } catch (e) {
-    setConn("off", "serial read: " + e.message);
-  } finally {
-    try { reader.releaseLock(); } catch (e) {}
-    await piped;
-  }
-}
-
-// The sketch prefixes telemetry with log text ("Rx Telemetry OK: {...}"), so
-// take everything from the first brace rather than requiring a bare JSON line.
-function handleSerialLine(line) {
-  const i = line.indexOf("{");
-  if (i < 0) return;
-  try {
-    applyReport(JSON.parse(line.slice(i)));
-  } catch (e) { /* partial or non-telemetry line */ }
-}
-
-// ---- actuation ---------------------------------------------------------------
-// Sends the same commands the ground station's physical buttons issue. The Uno
-// forwards them verbatim to sendLoRaCommand(), so the node cannot distinguish a
-// dashboard click from a button press.
-//
-// LoRa transmit here is fire-and-forget with no acknowledgement, so a click is
-// never treated as success — it stays pending until a telemetry packet shows the
-// node actually changed state.
-const PENDING_MS = 10000;
-let pending = null;   // { label, check, at, btn }
-
-function actMsg(text, cls) {
-  const el = $("actMsg");
-  el.textContent = text;
-  el.className = "act-msg" + (cls ? " " + cls : "");
-}
-
-function controlsEnabled() {
-  return source === "serial" && port !== null;
-}
-
-const HINT_CONNECT = "connect over USB serial to send commands";
-
-function refreshControls() {
-  const on = controlsEnabled();
-  ["btnGuardian", "btnMonitor", "btnSleep"].forEach((id) => {
-    $(id).disabled = !on || pending !== null;
-  });
-  if (!on && !pending) {
-    actMsg(HINT_CONNECT);
-  } else if (on && !pending && $("actMsg").textContent === HINT_CONNECT) {
-    // clear only the hint — a pending or confirmed message must survive
-    actMsg("");
-  }
-}
-
-// One byte per command. The Uno decodes it with a switch and no buffer, which
-// keeps the whole USB input path free of persistent SRAM on a 2 KB part.
-// G = arm (GUARDIAN), M = disarm (MONITOR), P = sleep (POWER).
-async function writeCommand(code) {
-  if (!port || !port.writable) {
-    actMsg("not connected", "fail");
-    return false;
-  }
-  const writer = port.writable.getWriter();
-  try {
-    await writer.write(new TextEncoder().encode(code));
-    return true;
-  } catch (e) {
-    actMsg("send failed: " + e.message, "fail");
-    return false;
-  } finally {
-    writer.releaseLock();
-  }
-}
-
-async function sendAction(label, code, check, btnId) {
-  if (pending) return;
-  const btn = $(btnId);
-  pending = { label, check, at: Date.now(), btn };
-  btn.setAttribute("data-pending", "true");
-  refreshControls();
-  actMsg(label + " — sent, waiting for the node…");
-
-  if (!(await writeCommand(code))) { clearPending(); return; }
-
-  setTimeout(() => {
-    if (pending && Date.now() - pending.at >= PENDING_MS) {
-      const l = pending.label;
-      clearPending();
-      actMsg(l + " — no response, the node may not have heard it", "fail");
-    }
-  }, PENDING_MS + 100);
-}
-
-function clearPending() {
-  if (pending && pending.btn) pending.btn.removeAttribute("data-pending");
-  pending = null;
-  refreshControls();
-}
-
-// Called from applyReport once each packet is normalized.
-function checkPending(r) {
-  if (!pending) return;
-  if (pending.check(r)) {
-    const l = pending.label;
-    clearPending();
-    actMsg(l + " — confirmed by the node", "ok");
-  }
-}
-
-function connectMqtt() {
-  const url = $("broker").value.trim();
-  const topic = $("topic").value.trim();
-  if (client) { try { client.end(true); } catch (e) {} }
-
-  setConn("", "connecting…");
-  client = mqtt.connect(url, { connectTimeout: 8000, reconnectPeriod: 4000 });
-
-  client.on("connect", () => {
-    setConn("on", "connected");
-    client.subscribe(topic, (err) => {
-      if (err) setConn("off", "subscribe failed: " + err.message);
     });
-  });
-  client.on("reconnect", () => setConn("", "reconnecting…"));
-  client.on("error", (e) => setConn("off", "error: " + e.message));
-  client.on("close", () => setConn("off", "disconnected"));
 
-  client.on("message", (t, payload) => {
-    try {
-      applyReport(JSON.parse(payload.toString()));
-    } catch (e) {
-      console.warn("bad payload on", t, e);
+    // --- READ STREAM & INBOUND JSON PARSER ---
+    async function readSerialStream() {
+      while (port.readable) {
+        reader = port.readable.getReader();
+        try {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            rxBuffer += decoder.decode(value);
+            
+            let lines = rxBuffer.split('\n');
+            rxBuffer = lines.pop();
+
+            for (let line of lines) {
+              parseJSONPacket(line.trim());
+            }
+          }
+        } catch (err) {
+          logConsole('Read Error: ' + err.message);
+        } finally {
+          reader.releaseLock();
+        }
+      }
     }
-  });
-}
 
-// Dispatches to whichever transport is selected.
-function connect() {
-  if (source === "serial") connectSerial();
-  else connectMqtt();
-}
+    // --- DATA PROCESSOR & UI UPDATE ---
+    function parseJSONPacket(rawString) {
+      if (!rawString.startsWith('{') || !rawString.endsWith('}')) return;
 
-function setSource(next) {
-  if (next === source) return;
-  source = next;
+      try {
+        const data = JSON.parse(rawString);
 
-  // tear down whichever transport we are leaving
-  if (next === "serial") {
-    if (client) { try { client.end(true); } catch (e) {} client = null; }
-  } else {
-    disconnectSerial();
-  }
+        if (data.temp !== undefined) document.getElementById('val-temp').textContent = Number(data.temp).toFixed(1);
+        if (data.hum !== undefined) document.getElementById('val-hum').textContent = Number(data.hum).toFixed(1);
+        if (data.voc !== undefined) document.getElementById('val-voc').textContent = data.voc;
+        if (data.mode !== undefined) document.getElementById('val-mode').textContent = data.mode;
+        if (data.gsm_subs !== undefined) document.getElementById('val-subs').textContent = data.gsm_subs;
+        
+        if (data.rssi !== undefined) document.getElementById('val-rssi').textContent = data.rssi;
+        if (data.snr !== undefined) document.getElementById('val-snr').textContent = data.snr;
+        if (data.packets !== undefined) document.getElementById('val-pkts').textContent = data.packets;
 
-  $("srcSerial").setAttribute("aria-pressed", String(next === "serial"));
-  $("srcMqtt").setAttribute("aria-pressed", String(next === "mqtt"));
-  $("mqttFields").hidden = (next !== "mqtt");
-  clearPending();
-  refreshControls();
-  setConn("", next === "serial" ? "click Connect and pick the board" : "");
-}
+        const breachBadge = document.getElementById('badge-breach');
+        if (data.breach) {
+          breachBadge.textContent = 'BREACH DETECTED';
+          breachBadge.className = 'badge badge-breach';
+        } else {
+          breachBadge.textContent = 'NOMINAL';
+          breachBadge.className = 'badge badge-safe';
+        }
 
-// ---- controls ---------------------------------------------------------------
-function buildSegs() {
-  const mseg = $("metricSeg");
-  KEYS.forEach((k) => {
-    const b = document.createElement("button");
-    b.type = "button";
-    b.setAttribute("aria-pressed", String(k === activeMetric));
-    const key = document.createElement("span");
-    key.className = "key";
-    key.style.background = cssVar(META[k].color);
-    b.appendChild(key);
-    b.appendChild(document.createTextNode(META[k].label));
-    b.addEventListener("click", () => {
-      activeMetric = k;
-      hoverIndex = -1;
-      [...mseg.children].forEach((c, i) =>
-        c.setAttribute("aria-pressed", String(KEYS[i] === k)));
-      renderHistory();
-    });
-    mseg.appendChild(b);
-  });
+        const timestamp = new Date().toLocaleTimeString();
+        pushChartData(timestamp, data.temp, data.hum, data.voc);
 
-  const rseg = $("rangeSeg");
-  RANGES.forEach((r) => {
-    const b = document.createElement("button");
-    b.type = "button";
-    b.textContent = r.label;
-    b.setAttribute("aria-pressed", String(r.ms === activeRange));
-    b.addEventListener("click", () => {
-      activeRange = r.ms;
-      hoverIndex = -1;
-      [...rseg.children].forEach((c, i) =>
-        c.setAttribute("aria-pressed", String(RANGES[i].ms === r.ms)));
-      renderHistory();
-    });
-    rseg.appendChild(b);
-  });
-
-  const vseg = $("viewSeg");
-  [["chart", "Chart"], ["table", "Table"]].forEach(([id, label]) => {
-    const b = document.createElement("button");
-    b.type = "button";
-    b.textContent = label;
-    b.setAttribute("aria-pressed", String(id === viewMode));
-    b.addEventListener("click", () => {
-      viewMode = id;
-      [...vseg.children].forEach((c) =>
-        c.setAttribute("aria-pressed", String(c.textContent === label)));
-      renderHistory();
-    });
-    vseg.appendChild(b);
-  });
-}
-
-function wireChartInteraction() {
-  const svg = $("histChart");
-  svg.addEventListener("pointermove", (e) => {
-    const i = nearestIndex(e.clientX);
-    if (i >= 0) showHover(i);
-  });
-  svg.addEventListener("pointerleave", hideHover);
-  svg.addEventListener("blur", hideHover);
-  svg.addEventListener("keydown", (e) => {
-    if (!plotGeom) return;
-    if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
-      e.preventDefault();
-      const start = hoverIndex < 0 ? plotGeom.pts.length - 1 : hoverIndex;
-      showHover(start + (e.key === "ArrowRight" ? 1 : -1));
-    } else if (e.key === "Home") {
-      e.preventDefault(); showHover(0);
-    } else if (e.key === "End") {
-      e.preventDefault(); showHover(plotGeom.pts.length - 1);
-    } else if (e.key === "Escape") {
-      hideHover();
+      } catch (err) {
+        logConsole('JSON Parse Error: ' + rawString);
+      }
     }
-  });
-}
 
-$("connectBtn").addEventListener("click", connect);
-$("srcSerial").addEventListener("click", () => setSource("serial"));
-$("srcMqtt").addEventListener("click", () => setSource("mqtt"));
+    function pushChartData(label, temp, hum, voc) {
+      telemetryChart.data.labels.push(label);
+      telemetryChart.data.datasets[0].data.push(temp ?? null);
+      telemetryChart.data.datasets[1].data.push(hum ?? null);
+      telemetryChart.data.datasets[2].data.push(voc ?? null);
 
-// The node reports mode as OVERRIDE / GUARDIAN / MONITOR, where GUARDIAN means
-// "breached" rather than "armed". So arming is confirmed by mode == OVERRIDE,
-// and disarming by mode != OVERRIDE — which stays correct during a breach.
-$("btnGuardian").addEventListener("click", () =>
-  sendAction("Guardian", "G",
-    (r) => String(r.mode || "").toUpperCase() === "OVERRIDE", "btnGuardian"));
+      if (telemetryChart.data.labels.length > 25) {
+        telemetryChart.data.labels.shift();
+        telemetryChart.data.datasets.forEach(ds => ds.data.shift());
+      }
+      telemetryChart.update('none');
+    }
 
-$("btnMonitor").addEventListener("click", () =>
-  sendAction("Monitor", "M",
-    (r) => String(r.mode || "").toUpperCase() !== "OVERRIDE", "btnMonitor"));
+    // --- COMMAND TRANSMITTER ---
+    async function sendCmd(cmd) {
+      if (!writer) {
+        alert('Please connect to your Base Station via WebSerial first.');
+        return;
+      }
+      await writer.write(cmd + '\n');
+      logConsole('TX > ' + cmd);
+    }
 
-// Sleep has no positive confirmation — the node stops transmitting, so the Link
-// tile is the evidence. Recovery is automatic: the node's only wake source is
-// esp_sleep_enable_timer_wakeup(SLEEP_TIMER_US), so it returns on its own.
-$("btnSleep").addEventListener("click", async () => {
-  if (!confirm(
-    "Put the probe to sleep now?\n\n" +
-    "It will stop transmitting for about 3 minutes, then wake itself and " +
-    "resume — its only wake source is a timer, so no trip to the probe is " +
-    "needed.\n\n" +
-    "Note this overrides the node's own rule of staying awake while armed " +
-    "or while a threshold is breached."
-  )) return;
-  if (await writeCommand("P"))
-    actMsg("Sleep — sent; the node should return within a few minutes");
-});
-$("clearBtn").addEventListener("click", () => {
-  if (!confirm("Delete all stored readings from this browser?")) return;
-  readings = [];
-  try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
-  hoverIndex = -1;
-  redrawSparks();
-  renderHistory();
-});
+    async function sendParamCmd(prefix, inputId) {
+      const field = document.getElementById(inputId);
+      const val = field.value.trim();
+      if (!val) return;
+      
+      const payload = prefix + val;
+      await sendCmd(payload);
+    }
 
-let resizeTimer = null;
-window.addEventListener("resize", () => {
-  clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => { redrawSparks(); renderHistory(); }, 120);
-});
-
-window.addEventListener("load", () => {
-  loadHistory();
-  buildSegs();
-  wireChartInteraction();
-  redrawSparks();
-  renderHistory();
-  // Web Serial's port picker requires a user gesture, so serial cannot
-  // auto-connect on load. MQTT still can.
-  refreshControls();
-  if (source === "mqtt") connect();
-  else setConn("", "click Connect and pick the board");
-});
-
-// Keep the "last N hours" window honest even while messages are sparse.
-setInterval(() => { if (readings.length) renderHistory(); }, 60000);
-
-// Link age advances with the clock, not with incoming data.
-setInterval(renderLink, 1000);
-</script>
+    function logConsole(msg) {
+      const consoleEl = document.getElementById('sys-log');
+      consoleEl.innerHTML += `[${new Date().toLocaleTimeString()}] ${msg}<br>`;
+      consoleEl.scrollTop = consoleEl.scrollHeight;
+    }
+  </script>
 </body>
 </html>

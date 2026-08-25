@@ -6,37 +6,48 @@
 #include <queue.h>
 #include <semphr.h>
 
-// --- Pin Definitions ---
+// --- Pin Configurations ---
 #define LORA_CS     10
 #define LORA_RST    9
 #define LORA_DIO0   2
 
-#define BTN_POWER    3
-#define BTN_GUARDIAN 4
-#define BTN_MONITOR  5
+#define BTN_POWER   4   // Single multifunction button on Pin 4
 
-#define LORA_FREQ    868E6
-#define DEBOUNCE_MS  250
+#define LORA_FREQ         868E6
+#define DEBOUNCE_MS       50
+#define LONG_PRESS_MS     1500
 
-// The queue carries a one-byte code rather than two 10-char strings: the wire
-// format is rebuilt from flash at transmit time, so four queued commands cost
-// 4 bytes of heap instead of 80.
-enum CommandCode : uint8_t {
+// Expanded Command Engine
+enum CommandType : uint8_t {
   CMD_GUARDIAN,
   CMD_MONITOR,
-  CMD_SLEEP
+  CMD_TOGGLE_MODE,
+  CMD_SLEEP,
+  CMD_GSM_CLEAR_SUBS,
+  CMD_GSM_ADD_SUB,
+  CMD_GSM_SEND_SMS
+};
+
+struct CommandMessage {
+  CommandType type;
+  char payload[32]; // Accommodates phone numbers or quick text payloads
 };
 
 struct BaseStationState {
   float temp = 0.0;
   float hum = 0.0;
   int voc = 0;
-  char mode[10] = "MONITOR";
+  uint16_t samples = 0;
+  bool breach = false;
+  uint8_t gsmSubs = 0;
+  char mode[12] = "MONITOR";
+
   float emaTemp = 0.0;
   float emaHum = 0.0;
+  float emaVoc = 0.0;
   bool lastDataValid = false;
   unsigned long lastRxTime = 0;
-  unsigned int packets = 0;   // received since power-up, reported to the dashboard
+  unsigned int packets = 0;
 };
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
@@ -45,39 +56,56 @@ BaseStationState baseState;
 QueueHandle_t xTxQueue = NULL;
 SemaphoreHandle_t xStateMutex = NULL;
 
-// Single entry point for both input sources, so a button press and a dashboard
-// click are indistinguishable downstream.
-static void queueCommand(uint8_t code) {
-  xQueueSendToBack(xTxQueue, &code, 0);
+static void queueCommand(CommandType type, const char* param = "") {
+  CommandMessage msg;
+  msg.type = type;
+  strncpy(msg.payload, param, sizeof(msg.payload) - 1);
+  msg.payload[sizeof(msg.payload) - 1] = '\0';
+  xQueueSendToBack(xTxQueue, &msg, 0);
 }
 
-// The dashboard sends one byte per command, so this needs no line buffer, no
-// parser and no JSON library — the whole USB input path costs zero persistent
-// SRAM. G = arm, M = disarm, P = sleep.
-static void handleSerialCommands() {
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    switch (c) {
-      case 'G': queueCommand(CMD_GUARDIAN); break;
-      case 'M': queueCommand(CMD_MONITOR);  break;
-      case 'P': queueCommand(CMD_SLEEP);    break;
-      default:  continue;   // newlines and stray bytes are ignored silently
-    }
-    // Echoed so the USB half of the chain is observable. No '{' in this line,
-    // so the dashboard's parser skips it.
-    Serial.print(F("[CMD] "));
-    Serial.println(c);
-  }
-}
-
-// Measured headroom beats assumed headroom: this is the gap between the top of
-// the heap (task stacks included) and the current stack pointer.
+// Memory diagnostic tool
 extern unsigned int __heap_start;
 extern void *__brkval;
-
 static int freeRam() {
   int marker;
   return (int)&marker - (__brkval == 0 ? (int)&__heap_start : (int)__brkval);
+}
+
+// --- Dynamic Serial Command Parser ---
+// Format supported:
+//  - Simple: G, M, T, P, C
+//  - Parametric: ADD:+254712345678 or SMS:Alert Test
+static void handleSerialCommands() {
+  while (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    if (input.length() == 0) continue;
+
+    if (input.equals("G")) {
+      queueCommand(CMD_GUARDIAN);
+    } else if (input.equals("M")) {
+      queueCommand(CMD_MONITOR);
+    } else if (input.equals("T")) {
+      queueCommand(CMD_TOGGLE_MODE);
+    } else if (input.equals("P")) {
+      queueCommand(CMD_SLEEP);
+    } else if (input.equals("C")) {
+      queueCommand(CMD_GSM_CLEAR_SUBS);
+    } else if (input.startsWith("ADD:")) {
+      String phone = input.substring(4);
+      queueCommand(CMD_GSM_ADD_SUB, phone.c_str());
+    } else if (input.startsWith("SMS:")) {
+      String text = input.substring(4);
+      queueCommand(CMD_GSM_SEND_SMS, text.c_str());
+    } else {
+      Serial.print(F("[CMD ERR] Unknown: "));
+      Serial.println(input);
+      continue;
+    }
+    Serial.print(F("[CMD SENT] "));
+    Serial.println(input);
+  }
 }
 
 void vTaskButtons(void *pvParameters);
@@ -86,10 +114,7 @@ void vTaskDisplay(void *pvParameters);
 
 void setup() {
   Serial.begin(115200);
-
   pinMode(BTN_POWER, INPUT_PULLUP);
-  pinMode(BTN_GUARDIAN, INPUT_PULLUP);
-  pinMode(BTN_MONITOR, INPUT_PULLUP);
 
   lcd.init();
   lcd.backlight();
@@ -106,22 +131,18 @@ void setup() {
 
   LoRa.setSpreadingFactor(7);
   LoRa.setSignalBandwidth(125E3);
-  LoRa.setCodingRate4(5); // Must match ESP32 Sync Word
+  LoRa.setCodingRate4(5);
   LoRa.enableCrc();
   LoRa.receive();
 
-  xTxQueue = xQueueCreate(4, sizeof(uint8_t));
+  xTxQueue = xQueueCreate(6, sizeof(CommandMessage));
   xStateMutex = xSemaphoreCreateMutex();
 
-  // 128 not 100: this task now also runs handleSerialCommands(), one frame
-  // deeper than the button path, and the LoRa task freed 100 bytes.
-  xTaskCreate(vTaskButtons, "Btn", 128, NULL, 3, NULL);
-  xTaskCreate(vTaskLoRa,    "LoRa", 140, NULL, 2, NULL);
+  xTaskCreate(vTaskButtons, "Btn",  128, NULL, 3, NULL);
+  xTaskCreate(vTaskLoRa,    "LoRa", 190, NULL, 2, NULL);
   xTaskCreate(vTaskDisplay, "Disp", 160, NULL, 1, NULL);
 
-  // Printed after the stacks are allocated, so this is the real remaining
-  // headroom rather than the static figure the linker reports.
-  Serial.print(F("Free SRAM after task creation: "));
+  Serial.print(F("Free SRAM after tasks: "));
   Serial.println(freeRam());
 
   vTaskStartScheduler();
@@ -129,101 +150,122 @@ void setup() {
 
 void loop() {}
 
+// --- Button Task ---
 void vTaskButtons(void *pvParameters) {
-  TickType_t xLastPower = 0, xLastGuardian = 0, xLastMonitor = 0;
+  bool buttonWasPressed = false;
+  unsigned long pressStartTime = 0;
 
   for (;;) {
-    TickType_t xNow = xTaskGetTickCount();
+    bool isPressed = (digitalRead(BTN_POWER) == LOW);
+    unsigned long now = millis();
 
-    if (digitalRead(BTN_POWER) == LOW && (xNow - xLastPower > pdMS_TO_TICKS(DEBOUNCE_MS))) {
-      xLastPower = xNow;
-      queueCommand(CMD_SLEEP);
+    if (isPressed && !buttonWasPressed) {
+      buttonWasPressed = true;
+      pressStartTime = now;
+    } 
+    else if (!isPressed && buttonWasPressed) {
+      buttonWasPressed = false;
+      unsigned long duration = now - pressStartTime;
+
+      if (duration >= DEBOUNCE_MS) {
+        if (duration >= LONG_PRESS_MS) {
+          queueCommand(CMD_SLEEP);
+        } else {
+          queueCommand(CMD_TOGGLE_MODE);
+        }
+      }
     }
 
-    if (digitalRead(BTN_GUARDIAN) == LOW && (xNow - xLastGuardian > pdMS_TO_TICKS(DEBOUNCE_MS))) {
-      xLastGuardian = xNow;
-      queueCommand(CMD_GUARDIAN);
-    }
-
-    if (digitalRead(BTN_MONITOR) == LOW && (xNow - xLastMonitor > pdMS_TO_TICKS(DEBOUNCE_MS))) {
-      xLastMonitor = xNow;
-      queueCommand(CMD_MONITOR);
-    }
-
-    // The dashboard is just a fourth input onto the same queue — no extra task,
-    // no extra stack.
     handleSerialCommands();
-
     vTaskDelay(pdMS_TO_TICKS(35));
   }
 }
 
+// --- LoRa Communications Engine ---
 void vTaskLoRa(void *pvParameters) {
-  uint8_t txCode;
-  // static: a 96-byte local would consume most of this task's stack, and a
-  // FreeRTOS stack overflow on AVR corrupts silently rather than reporting.
-  static char rxBuffer[96];
+  CommandMessage txMsg;
+  static char rxBuffer[160];
 
   for (;;) {
-    // 1. Send Queued Commands
-    if (xQueueReceive(xTxQueue, &txCode, 0) == pdTRUE) {
+    // 1. Process & Format Outbound Control JSON Frames
+    if (xQueueReceive(xTxQueue, &txMsg, 0) == pdTRUE) {
       LoRa.idle();
       LoRa.beginPacket();
-      // Wire format rebuilt from flash — F() keeps these out of SRAM entirely.
-      switch (txCode) {
-        case CMD_GUARDIAN: LoRa.print(F("{\"cmd\":\"SET_MODE\",\"val\":\"GUARDIAN\"}")); break;
-        case CMD_MONITOR:  LoRa.print(F("{\"cmd\":\"SET_MODE\",\"val\":\"MONITOR\"}"));  break;
-        case CMD_SLEEP:    LoRa.print(F("{\"cmd\":\"POWER\",\"val\":\"OFF\"}"));         break;
+      switch (txMsg.type) {
+        case CMD_GUARDIAN:
+          LoRa.print(F("{\"cmd\":\"SET_MODE\",\"val\":\"GUARDIAN\"}"));
+          break;
+        case CMD_MONITOR:
+          LoRa.print(F("{\"cmd\":\"SET_MODE\",\"val\":\"MONITOR\"}"));
+          break;
+        case CMD_TOGGLE_MODE:
+          LoRa.print(F("{\"cmd\":\"SET_MODE\",\"val\":\"TOGGLE\"}"));
+          break;
+        case CMD_SLEEP:
+          LoRa.print(F("{\"cmd\":\"POWER\",\"val\":\"OFF\"}"));
+          break;
+        case CMD_GSM_CLEAR_SUBS:
+          LoRa.print(F("{\"cmd\":\"GSM_CLEAR_SUBS\",\"val\":\"\"}"));
+          break;
+        case CMD_GSM_ADD_SUB:
+          LoRa.print(F("{\"cmd\":\"GSM_ADD_SUB\",\"val\":\""));
+          LoRa.print(txMsg.payload);
+          LoRa.print(F("\"}"));
+          break;
+        case CMD_GSM_SEND_SMS:
+          LoRa.print(F("{\"cmd\":\"GSM_SEND_SMS\",\"val\":\""));
+          LoRa.print(txMsg.payload);
+          LoRa.print(F("\"}"));
+          break;
       }
       LoRa.endPacket();
-      
       vTaskDelay(pdMS_TO_TICKS(10));
       LoRa.receive();
     }
 
-    // 2. Read Packets Safely Into Fixed Static Buffer
+    // 2. Read Inbound LoRa Packets
     int packetSize = LoRa.parsePacket();
     if (packetSize > 0) {
       int bytesRead = 0;
       while (LoRa.available() && bytesRead < (sizeof(rxBuffer) - 1)) {
         rxBuffer[bytesRead++] = (char)LoRa.read();
       }
-      rxBuffer[bytesRead] = '\0'; // Explicit Null-Termination
+      rxBuffer[bytesRead] = '\0';
 
       baseState.packets++;
 
-      // One line for the dashboard: the node's own payload with radio stats
-      // spliced in before the closing brace. Splicing rather than rebuilding
-      // preserves fields this board never parses (voc, breach) and needs no
-      // output buffer of its own.
+      // Serial Passthrough for PC Dashboard
       if (bytesRead > 1 && rxBuffer[bytesRead - 1] == '}') {
         Serial.write((const uint8_t *)rxBuffer, bytesRead - 1);
         Serial.print(F(",\"rssi\":"));    Serial.print(LoRa.packetRssi());
         Serial.print(F(",\"snr\":"));     Serial.print(LoRa.packetSnr(), 1);
         Serial.print(F(",\"packets\":")); Serial.print(baseState.packets);
         Serial.println('}');
-      } else {
-        Serial.print(F("[RX MALFORMED] "));
-        Serial.println(rxBuffer);
       }
 
-      // Simple parsing using string search
-      char *tempPtr = strstr(rxBuffer, "\"temp\":");
-      char *humPtr  = strstr(rxBuffer, "\"hum\":");
-      char *modePtr = strstr(rxBuffer, "\"mode\":");
+      // Zero-Heap Field Extraction
+      char *tempPtr   = strstr(rxBuffer, "\"temp\":");
+      char *humPtr    = strstr(rxBuffer, "\"hum\":");
+      char *vocPtr    = strstr(rxBuffer, "\"voc\":");
+      char *sampPtr   = strstr(rxBuffer, "\"samples\":");
+      char *modePtr   = strstr(rxBuffer, "\"mode\":");
+      char *breachPtr = strstr(rxBuffer, "\"breach\":");
+      char *gsmSubPtr = strstr(rxBuffer, "\"gsm_subs\":");
 
       if (tempPtr != NULL && xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         baseState.temp = atof(tempPtr + 7);
-        if (humPtr != NULL) {
-          baseState.hum = atof(humPtr + 6);
-        }
+        if (humPtr)    baseState.hum     = atof(humPtr + 6);
+        if (vocPtr)    baseState.voc     = atoi(vocPtr + 6);
+        if (sampPtr)   baseState.samples = atoi(sampPtr + 10);
+        if (breachPtr) baseState.breach  = (strstr(breachPtr + 9, "true") != NULL);
+        if (gsmSubPtr) baseState.gsmSubs = atoi(gsmSubPtr + 11);
 
-        if (modePtr != NULL) {
+        if (modePtr) {
           char *modeStart = strchr(modePtr + 7, '"');
-          if (modeStart != NULL) {
+          if (modeStart) {
             modeStart++;
             char *modeEnd = strchr(modeStart, '"');
-            if (modeEnd != NULL) {
+            if (modeEnd) {
               size_t len = modeEnd - modeStart;
               if (len < sizeof(baseState.mode)) {
                 strncpy(baseState.mode, modeStart, len);
@@ -233,12 +275,15 @@ void vTaskLoRa(void *pvParameters) {
           }
         }
 
+        // Apply Exponential Moving Average (EMA)
         if (!baseState.lastDataValid) {
           baseState.emaTemp = baseState.temp;
           baseState.emaHum  = baseState.hum;
+          baseState.emaVoc  = (float)baseState.voc;
         } else {
           baseState.emaTemp = (0.3f * baseState.temp) + (0.7f * baseState.emaTemp);
           baseState.emaHum  = (0.3f * baseState.hum)  + (0.7f * baseState.emaHum);
+          baseState.emaVoc  = (0.3f * (float)baseState.voc) + (0.7f * baseState.emaVoc);
         }
 
         baseState.lastDataValid = true;
@@ -251,31 +296,39 @@ void vTaskLoRa(void *pvParameters) {
   }
 }
 
+// --- Display Task ---
 void vTaskDisplay(void *pvParameters) {
   for (;;) {
     if (xSemaphoreTake(xStateMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
       bool offline = (millis() - baseState.lastRxTime > 40000) || !baseState.lastDataValid;
 
-      lcd.setCursor(0, 0);
       if (offline) {
-        lcd.print(F("LINK: SLEEP/OFF "));
+        lcd.setCursor(0, 0);
+        lcd.print(F("NODE: OFFLINE   "));
         lcd.setCursor(0, 1);
-        lcd.print(F("Waiting Node... "));
+        lcd.print(F("Waiting Data... "));
       } else {
-        if (baseState.mode[0] == 'G' || baseState.mode[0] == 'O') {
-          lcd.print(F("GARD "));
-        } else {
-          lcd.print(F("INSP "));
-        }
-
+        // Top Line: Temperature, Humidity, VOC
+        lcd.setCursor(0, 0);
         lcd.print(F("T:"));
         lcd.print((int)baseState.emaTemp);
         lcd.print(F("C H:"));
         lcd.print((int)baseState.emaHum);
-        lcd.print(F("%   "));
+        lcd.print(F("% V:"));
+        lcd.print((int)baseState.emaVoc);
+        lcd.print(F("   "));
 
+        // Bottom Line: Mode & GSM Subscriber Count / Breach Flag
         lcd.setCursor(0, 1);
-        lcd.print(F("Status: Active  "));
+        if (baseState.breach) {
+          lcd.print(F("!ALARM BREACH!  "));
+        } else {
+          lcd.print(F("M:"));
+          lcd.print(baseState.mode);
+          lcd.print(F(" S:"));
+          lcd.print(baseState.gsmSubs);
+          lcd.print(F("   "));
+        }
       }
       xSemaphoreGive(xStateMutex);
     }
