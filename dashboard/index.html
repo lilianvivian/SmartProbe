@@ -920,6 +920,14 @@ function renderLink() {
     el.textContent = "live";
     el.style.color = "var(--good)";
     el.title = "Receiving telemetry.";
+  } else if (pending) {
+    // A command is in flight, so nodeStaysAwake reflects the state we just
+    // asked the node to leave. Claiming "sleeping" or "NO SIGNAL" off that
+    // stale reading is worse than admitting we don't know yet.
+    el.textContent = "changing " + fmtAge(age);
+    el.style.color = "var(--muted)";
+    el.title = "A command is in flight — the node's state is unknown until the "
+             + "next packet arrives.";
   } else if (nodeStaysAwake) {
     // Armed or breached at last contact, so the node should not be sleeping.
     el.textContent = "NO SIGNAL " + fmtAge(age);

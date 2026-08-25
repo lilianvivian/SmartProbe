@@ -18,9 +18,13 @@
 #define LORA_FREQ    868E6
 #define DEBOUNCE_MS  250
 
-struct CommandMessage {
-  char cmd[10];
-  char val[10];
+// The queue carries a one-byte code rather than two 10-char strings: the wire
+// format is rebuilt from flash at transmit time, so four queued commands cost
+// 4 bytes of heap instead of 80.
+enum CommandCode : uint8_t {
+  CMD_GUARDIAN,
+  CMD_MONITOR,
+  CMD_SLEEP
 };
 
 struct BaseStationState {
@@ -41,24 +45,10 @@ BaseStationState baseState;
 QueueHandle_t xTxQueue = NULL;
 SemaphoreHandle_t xStateMutex = NULL;
 
-// Command literals held in flash. A plain string literal on AVR is copied into
-// .data at startup and costs SRAM for the whole run; PROGMEM keeps it in
-// program space and pays only a transient copy when a command is queued.
-const char CMD_SET_MODE[] PROGMEM = "SET_MODE";
-const char CMD_POWER[]    PROGMEM = "POWER";
-const char VAL_GUARDIAN[] PROGMEM = "GUARDIAN";
-const char VAL_MONITOR[]  PROGMEM = "MONITOR";
-const char VAL_TOGGLE[]   PROGMEM = "TOGGLE";
-
 // Single entry point for both input sources, so a button press and a dashboard
 // click are indistinguishable downstream.
-static void queueCommand(const char *cmdP, const char *valP) {
-  CommandMessage msg;
-  strncpy_P(msg.cmd, cmdP, sizeof(msg.cmd) - 1);
-  msg.cmd[sizeof(msg.cmd) - 1] = '\0';
-  strncpy_P(msg.val, valP, sizeof(msg.val) - 1);
-  msg.val[sizeof(msg.val) - 1] = '\0';
-  xQueueSendToBack(xTxQueue, &msg, 0);
+static void queueCommand(uint8_t code) {
+  xQueueSendToBack(xTxQueue, &code, 0);
 }
 
 // The dashboard sends one byte per command, so this needs no line buffer, no
@@ -66,12 +56,17 @@ static void queueCommand(const char *cmdP, const char *valP) {
 // SRAM. G = arm, M = disarm, P = sleep.
 static void handleSerialCommands() {
   while (Serial.available()) {
-    switch (Serial.read()) {
-      case 'G': queueCommand(CMD_SET_MODE, VAL_GUARDIAN); break;
-      case 'M': queueCommand(CMD_SET_MODE, VAL_MONITOR);  break;
-      case 'P': queueCommand(CMD_POWER,    VAL_TOGGLE);   break;
-      default:  break;   // newlines and stray bytes are ignored
+    char c = (char)Serial.read();
+    switch (c) {
+      case 'G': queueCommand(CMD_GUARDIAN); break;
+      case 'M': queueCommand(CMD_MONITOR);  break;
+      case 'P': queueCommand(CMD_SLEEP);    break;
+      default:  continue;   // newlines and stray bytes are ignored silently
     }
+    // Echoed so the USB half of the chain is observable. No '{' in this line,
+    // so the dashboard's parser skips it.
+    Serial.print(F("[CMD] "));
+    Serial.println(c);
   }
 }
 
@@ -115,11 +110,13 @@ void setup() {
   LoRa.enableCrc();
   LoRa.receive();
 
-  xTxQueue = xQueueCreate(4, sizeof(CommandMessage));
+  xTxQueue = xQueueCreate(4, sizeof(uint8_t));
   xStateMutex = xSemaphoreCreateMutex();
 
-  xTaskCreate(vTaskButtons, "Btn", 100, NULL, 3, NULL);
-  xTaskCreate(vTaskLoRa,    "LoRa", 240, NULL, 2, NULL);
+  // 128 not 100: this task now also runs handleSerialCommands(), one frame
+  // deeper than the button path, and the LoRa task freed 100 bytes.
+  xTaskCreate(vTaskButtons, "Btn", 128, NULL, 3, NULL);
+  xTaskCreate(vTaskLoRa,    "LoRa", 140, NULL, 2, NULL);
   xTaskCreate(vTaskDisplay, "Disp", 160, NULL, 1, NULL);
 
   // Printed after the stacks are allocated, so this is the real remaining
@@ -140,17 +137,17 @@ void vTaskButtons(void *pvParameters) {
 
     if (digitalRead(BTN_POWER) == LOW && (xNow - xLastPower > pdMS_TO_TICKS(DEBOUNCE_MS))) {
       xLastPower = xNow;
-      queueCommand(CMD_POWER, VAL_TOGGLE);
+      queueCommand(CMD_SLEEP);
     }
 
     if (digitalRead(BTN_GUARDIAN) == LOW && (xNow - xLastGuardian > pdMS_TO_TICKS(DEBOUNCE_MS))) {
       xLastGuardian = xNow;
-      queueCommand(CMD_SET_MODE, VAL_GUARDIAN);
+      queueCommand(CMD_GUARDIAN);
     }
 
     if (digitalRead(BTN_MONITOR) == LOW && (xNow - xLastMonitor > pdMS_TO_TICKS(DEBOUNCE_MS))) {
       xLastMonitor = xNow;
-      queueCommand(CMD_SET_MODE, VAL_MONITOR);
+      queueCommand(CMD_MONITOR);
     }
 
     // The dashboard is just a fourth input onto the same queue — no extra task,
@@ -162,19 +159,22 @@ void vTaskButtons(void *pvParameters) {
 }
 
 void vTaskLoRa(void *pvParameters) {
-  CommandMessage txMsg;
-  char rxBuffer[128];
+  uint8_t txCode;
+  // static: a 96-byte local would consume most of this task's stack, and a
+  // FreeRTOS stack overflow on AVR corrupts silently rather than reporting.
+  static char rxBuffer[96];
 
   for (;;) {
     // 1. Send Queued Commands
-    if (xQueueReceive(xTxQueue, &txMsg, 0) == pdTRUE) {
+    if (xQueueReceive(xTxQueue, &txCode, 0) == pdTRUE) {
       LoRa.idle();
       LoRa.beginPacket();
-      LoRa.print(F("{\"cmd\":\""));
-      LoRa.print(txMsg.cmd);
-      LoRa.print(F("\",\"val\":\""));
-      LoRa.print(txMsg.val);
-      LoRa.print(F("\"}"));
+      // Wire format rebuilt from flash — F() keeps these out of SRAM entirely.
+      switch (txCode) {
+        case CMD_GUARDIAN: LoRa.print(F("{\"cmd\":\"SET_MODE\",\"val\":\"GUARDIAN\"}")); break;
+        case CMD_MONITOR:  LoRa.print(F("{\"cmd\":\"SET_MODE\",\"val\":\"MONITOR\"}"));  break;
+        case CMD_SLEEP:    LoRa.print(F("{\"cmd\":\"POWER\",\"val\":\"OFF\"}"));         break;
+      }
       LoRa.endPacket();
       
       vTaskDelay(pdMS_TO_TICKS(10));
