@@ -108,7 +108,12 @@ void setup() {
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5); // Must match ESP32 Sync Word
   LoRa.enableCrc();
-  LoRa.receive();
+  // Deliberately NO LoRa.receive() here. receive() selects RX_CONTINUOUS, but
+  // parsePacket() below is written for RX_SINGLE: when it finds the radio in
+  // any other mode it writes REG_FIFO_ADDR_PTR back to 0 before switching. A
+  // packet then gets read from the start of the FIFO instead of its own offset,
+  // which decodes as binary garbage. Polling parsePacket() alone lets the
+  // library own the mode consistently.
 
   xTxQueue = xQueueCreate(4, sizeof(uint8_t));
   xStateMutex = xSemaphoreCreateMutex();
@@ -184,8 +189,9 @@ void vTaskLoRa(void *pvParameters) {
       Serial.print(txCode == CMD_GUARDIAN ? 'G' : txCode == CMD_MONITOR ? 'M' : 'P');
       Serial.println(sent ? F(" ok") : F(" FAILED"));
 
+      // parsePacket() re-arms reception on the next pass; calling receive()
+      // here would put the radio back into the mismatched mode.
       vTaskDelay(pdMS_TO_TICKS(10));
-      LoRa.receive();
     }
 
     // 2. Read Packets Safely Into Fixed Static Buffer
