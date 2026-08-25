@@ -1168,14 +1168,17 @@ function refreshControls() {
   }
 }
 
-async function writeCommand(cmd, val) {
+// One byte per command. The Uno decodes it with a switch and no buffer, which
+// keeps the whole USB input path free of persistent SRAM on a 2 KB part.
+// G = arm (GUARDIAN), M = disarm (MONITOR), P = sleep (POWER).
+async function writeCommand(code) {
   if (!port || !port.writable) {
     actMsg("not connected", "fail");
     return false;
   }
   const writer = port.writable.getWriter();
   try {
-    await writer.write(new TextEncoder().encode(JSON.stringify({ cmd, val }) + "\n"));
+    await writer.write(new TextEncoder().encode(code));
     return true;
   } catch (e) {
     actMsg("send failed: " + e.message, "fail");
@@ -1185,7 +1188,7 @@ async function writeCommand(cmd, val) {
   }
 }
 
-async function sendAction(label, cmd, val, check, btnId) {
+async function sendAction(label, code, check, btnId) {
   if (pending) return;
   const btn = $(btnId);
   pending = { label, check, at: Date.now(), btn };
@@ -1193,7 +1196,7 @@ async function sendAction(label, cmd, val, check, btnId) {
   refreshControls();
   actMsg(label + " — sent, waiting for the node…");
 
-  if (!(await writeCommand(cmd, val))) { clearPending(); return; }
+  if (!(await writeCommand(code))) { clearPending(); return; }
 
   setTimeout(() => {
     if (pending && Date.now() - pending.at >= PENDING_MS) {
@@ -1358,11 +1361,11 @@ $("srcMqtt").addEventListener("click", () => setSource("mqtt"));
 // "breached" rather than "armed". So arming is confirmed by mode == OVERRIDE,
 // and disarming by mode != OVERRIDE — which stays correct during a breach.
 $("btnGuardian").addEventListener("click", () =>
-  sendAction("Guardian", "SET_MODE", "GUARDIAN",
+  sendAction("Guardian", "G",
     (r) => String(r.mode || "").toUpperCase() === "OVERRIDE", "btnGuardian"));
 
 $("btnMonitor").addEventListener("click", () =>
-  sendAction("Monitor", "SET_MODE", "MONITOR",
+  sendAction("Monitor", "M",
     (r) => String(r.mode || "").toUpperCase() !== "OVERRIDE", "btnMonitor"));
 
 // Sleep has no positive confirmation — the node stops transmitting, so the Link
@@ -1377,7 +1380,7 @@ $("btnSleep").addEventListener("click", async () => {
     "Note this overrides the node's own rule of staying awake while armed " +
     "or while a threshold is breached."
   )) return;
-  if (await writeCommand("POWER", "OFF"))
+  if (await writeCommand("P"))
     actMsg("Sleep — sent; the node should return within a few minutes");
 });
 $("clearBtn").addEventListener("click", () => {
