@@ -9,7 +9,7 @@
 #define GSM_RX_PIN          16
 
 // Indicator LEDs
-#define GREEN_LED           10
+#define GREEN_LED           15
 #define YELLOW_LED          11
 #define RED_LED             12
 
@@ -39,11 +39,16 @@
 #define MQTT_BROKER_IP      "192.168.40.66" // IP of your laptop/server
 #define MQTT_PORT           1883
 
-#define LORA_SCK_PIN    7
-#define LORA_MISO_PIN   8
-#define LORA_MOSI_PIN   9
-#define LORA_CS_PIN     21
-#define LORA_RST_PIN    13
-#define LORA_DIO0_PIN   14
+#define LORA_SCK_PIN    21
+#define LORA_MISO_PIN   7
+#define LORA_MOSI_PIN   13
+#define LORA_CS_PIN     10
+#define LORA_RST_PIN    14
+#define LORA_DIO0_PIN   2
+
+// --- Onsite Buttons Pin Mapping ---
+#define INSPECT_BUTTON       48  // Input-only: Requires external pull-down resistor
+#define MODE_BUTTON          47  // Input-only: Requires external pull-down resistor
+#define POWER_BUTTON         9  // Power / Sleep Button
 
 #endif // PINS_H
