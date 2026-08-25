@@ -1148,7 +1148,7 @@ function handleSerialLine(line) {
 // LoRa transmit here is fire-and-forget with no acknowledgement, so a click is
 // never treated as success — it stays pending until a telemetry packet shows the
 // node actually changed state.
-const PENDING_MS = 10000;
+const PENDING_MS = 6000;   // node sends every 2s: 3 missed packets is conclusive
 let pending = null;   // { label, check, at, btn }
 
 function actMsg(text, cls) {
@@ -1165,8 +1165,11 @@ const HINT_CONNECT = "connect over USB serial to send commands";
 
 function refreshControls() {
   const on = controlsEnabled();
+  // Only the button awaiting confirmation is disabled. Greying out all three
+  // made every click during the pending window vanish silently, which read as
+  // "the dashboard does nothing" and invited repeated presses.
   ["btnGuardian", "btnMonitor", "btnSleep"].forEach((id) => {
-    $(id).disabled = !on || pending !== null;
+    $(id).disabled = !on || (pending !== null && pending.btnId === id);
   });
   if (!on && !pending) {
     actMsg(HINT_CONNECT);
@@ -1197,9 +1200,12 @@ async function writeCommand(code) {
 }
 
 async function sendAction(label, code, check, btnId) {
-  if (pending) return;
+  // Supersede any command still awaiting confirmation rather than dropping this
+  // one. Every command is idempotent at the node - SET_MODE/GUARDIAN lands in
+  // the same state however many times it arrives - so a retry is always safe.
+  if (pending) clearPending();
   const btn = $(btnId);
-  pending = { label, check, at: Date.now(), btn };
+  pending = { label, check, at: Date.now(), btn, btnId };
   btn.setAttribute("data-pending", "true");
   refreshControls();
   actMsg(label + " — sent, waiting for the node…");
@@ -1210,7 +1216,7 @@ async function sendAction(label, code, check, btnId) {
     if (pending && Date.now() - pending.at >= PENDING_MS) {
       const l = pending.label;
       clearPending();
-      actMsg(l + " — no response, the node may not have heard it", "fail");
+      actMsg(l + " — no confirmation; press again to retry", "fail");
     }
   }, PENDING_MS + 100);
 }
