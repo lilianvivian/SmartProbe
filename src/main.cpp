@@ -52,6 +52,8 @@
 // Deep-sleep wakeup mask ONLY for POWER_BUTTON (GPIO 15)
 #define BUTTON_WAKEUP_MASK   (1ULL << POWER_BUTTON)
 
+RTC_DATA_ATTR bool sysPowerState = true;
+
 // --- TinyML Arena ---
 namespace {
   tflite::ErrorReporter* errorReporter = nullptr;
@@ -202,46 +204,56 @@ void stopActuators() {
 }
 
 void triggerDeepSleep() {
+  Serial.println(F("[POWER] Toggling Power State -> OFF. Entering Deep Sleep..."));
+  Serial.flush();
+
+  sysPowerState = false;
+
+  // 1. Delete tasks to release core interfaces
+  vTaskDelete(xTaskGetHandle("LoRaTask"));
+  vTaskDelete(xTaskGetHandle("SystemEngine"));
+  vTaskDelete(xTaskGetHandle("GSM_Task"));
+  vTaskDelete(xTaskGetHandle("ButtonTask"));
+
+  // 2. Put SX127x into Continuous Receive Mode (DIO0 will fire RxDone HIGH on full packet)
+  if (xSpiMutex != NULL && xSemaphoreTake(xSpiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+ 
+    LoRa.receive(); // Active Continuous RX
+    xSemaphoreGive(xSpiMutex);
+  }
+
+  // 3. Turn off local status indicators and actuators
   digitalWrite(GREEN_LED, LOW);
   digitalWrite(YELLOW_LED, LOW);
   digitalWrite(RED_LED, LOW);
   digitalWrite(BUZZER_PIN, LOW);
   stopActuators();
 
-  if (xSpiMutex != NULL && xSemaphoreTake(xSpiMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-    LoRa.sleep(); // Force register refresh
-    LoRa.receive(); // Enter RX continuous mode
-    xSemaphoreGive(xSpiMutex);
-  }
-
-  // Clear pending button states
+  // 4. Wait for physical power button release if physically pressed
   pinMode(POWER_BUTTON, INPUT_PULLUP);
   while (digitalRead(POWER_BUTTON) == LOW) {
     vTaskDelay(pdMS_TO_TICKS(10));
   }
-  vTaskDelay(pdMS_TO_TICKS(100));
-  
-  // 1. Timer Wakeup
-  esp_sleep_enable_timer_wakeup(SLEEP_TIMER_US);
-  
-  // 2. Radio Signal Wakeup (DIO0 must be an RTC GPIO!)
+  vTaskDelay(pdMS_TO_TICKS(150));
+
+  // 5. Radio Wakeup via RTC EXT0 exclusively on LORA_DIO0_PIN (Active HIGH)
   #if defined(LORA_DIO0_PIN) && (LORA_DIO0_PIN >= 0)
-  rtc_gpio_deinit((gpio_num_t)LORA_DIO0_PIN);
+  rtc_gpio_init((gpio_num_t)LORA_DIO0_PIN);
+  rtc_gpio_set_direction((gpio_num_t)LORA_DIO0_PIN, RTC_GPIO_MODE_INPUT_ONLY);
   gpio_pullup_dis((gpio_num_t)LORA_DIO0_PIN);
-  gpio_pulldown_en((gpio_num_t)LORA_DIO0_PIN); // Ensure active HIGH trigger on DIO0
+  gpio_pulldown_en((gpio_num_t)LORA_DIO0_PIN); // Ensure line stays pulled down until RxDone
   esp_sleep_enable_ext0_wakeup((gpio_num_t)LORA_DIO0_PIN, 1);
   #endif
 
-  // 3. Button Wakeup (Active LOW on GPIO 15)
+  // 6. Power Button Wakeup via RTC EXT1 on POWER_BUTTON (GPIO 15)
+  rtc_gpio_init((gpio_num_t)POWER_BUTTON);
+  rtc_gpio_set_direction((gpio_num_t)POWER_BUTTON, RTC_GPIO_MODE_INPUT_ONLY);
   rtc_gpio_pullup_en((gpio_num_t)POWER_BUTTON);
   rtc_gpio_pulldown_dis((gpio_num_t)POWER_BUTTON);
   esp_sleep_enable_ext1_wakeup(BUTTON_WAKEUP_MASK, ESP_EXT1_WAKEUP_ALL_LOW);
-  
-  Serial.println(F("[POWER] Entering Deep Sleep... Listening for LoRa / Button"));
-  Serial.flush();
+
   esp_deep_sleep_start();
 }
-
 void checkWakeupReason() {
   esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
   switch (wakeup_reason) {
@@ -613,6 +625,11 @@ void vTaskSystemEngine(void *pvParameters) {
 void setup() {
   Serial.begin(115200);
 
+  rtc_gpio_deinit((gpio_num_t)POWER_BUTTON);
+  #if defined(LORA_DIO0_PIN) && (LORA_DIO0_PIN >= 0)
+  rtc_gpio_deinit((gpio_num_t)LORA_DIO0_PIN);
+  #endif
+  
   esp_err_t err = nvs_flash_init();
   if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
     ESP_ERROR_CHECK(nvs_flash_erase());
