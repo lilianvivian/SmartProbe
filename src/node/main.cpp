@@ -10,10 +10,10 @@
 #include <freertos/semphr.h>
 #include <freertos/event_groups.h>
 #include "pins.h"
-#include "protocol.h"
-#include <WiFi.h>
+#include <nvs_flash.h>
+#include <driver/rtc_io.h>
 
-// --- TinyML TensorFlow Lite Headers & Model ---
+// --- TinyML TensorFlow Lite Headers ---
 #include "tensorflow/lite/micro/all_ops_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_error_reporter.h"
@@ -27,25 +27,32 @@
 #endif
 
 // --- Configuration Constants ---
-#define PUMP_PWM_CHANNEL    0
-#define FAN_PWM_CHANNEL     1
-#define PWM_FREQ            1000
-#define PWM_RES             8
+#define PUMP_PWM_CHANNEL     0
+#define FAN_PWM_CHANNEL      1
+#define PWM_FREQ             1000
+#define PWM_RES              8
 
+#define LORA_FREQ            868E6
 
 #define MODE_INSPECT_BIT     (1UL << 0UL)
 #define MODE_OVERRIDE_BIT    (1UL << 1UL)
 #define THRESHOLD_BREACH_BIT (1UL << 2UL)
 #define ALL_MODES_MASK       (MODE_INSPECT_BIT | MODE_OVERRIDE_BIT)
 
-#define AWAKE_INTERVAL_SEC  (2 * 60)
-#define SLEEP_DURATION_SEC  (3 * 60)
-#define SLEEP_TIMER_US      (SLEEP_DURATION_SEC * 1000000ULL)
+#define AWAKE_INTERVAL_SEC   (2 * 60)
+#define SLEEP_DURATION_SEC   (3 * 60)
+#define SLEEP_TIMER_US       (SLEEP_DURATION_SEC * 1000000ULL)
 
-#define MAX_SUBSCRIBERS     5
-#define PHONE_LEN           16
+#define TX_FAST_INTERVAL_MS  (5000) // Fast 2-second interval for real-time LCD updates
+#define EMA_ALPHA            0.2f
 
-// Note: TEMP_THRESHOLD, HUM_THRESHOLD, and VOC_THRESHOLD are imported from pins.h
+#define MAX_SUBSCRIBERS      5
+#define PHONE_LEN            16
+
+// Deep-sleep wakeup mask ONLY for POWER_BUTTON (GPIO 15)
+#define BUTTON_WAKEUP_MASK   (1ULL << POWER_BUTTON)
+
+RTC_DATA_ATTR bool sysPowerState = true;
 
 // --- TinyML Arena ---
 namespace {
@@ -58,27 +65,22 @@ namespace {
   uint8_t tensorArena[kTensorArenaSize];
 }
 
-// --- Data Models & Commands ---
 enum SystemCommandType {
   CMD_SET_MODE_INSPECT,
   CMD_SET_MODE_OVERRIDE,
+  CMD_TOGGLE_MODE,
   CMD_TRIGGER_SLEEP
-};
-
-// The seq travels with the command so "ack" reports the sequence actually
-// APPLIED, not merely the one received.
-struct SystemCommand {
-  SystemCommandType type;
-  uint8_t seq;
 };
 
 struct SensorData {
   float temp;
   float humidity;
   int voc;
+  uint16_t sampleCount;
+  bool readyToTx;
 };
 
-// --- Global Objects & Handles ---
+// --- Global Objects ---
 DHT dht(DHT_PIN, DHT_TYPE);
 HardwareSerial gsmSerial(2);
 Preferences preferences;
@@ -86,75 +88,70 @@ Preferences preferences;
 EventGroupHandle_t xSystemEvents = NULL;
 QueueHandle_t gsmQueue = NULL;
 QueueHandle_t systemCmdQueue = NULL;
+QueueHandle_t loraTxQueue = NULL;
 SemaphoreHandle_t xPowerSleepSemaphore = NULL;
 SemaphoreHandle_t xActivityMutex = NULL;
-TaskHandle_t xSystemEngineTaskHandle = NULL;
+SemaphoreHandle_t xSpiMutex = NULL;
 
-SensorData latestMetrics = {-1.0f, -1.0f, 0};
+SensorData latestMetrics = {-1.0f, -1.0f, 0, 0, false};
 bool smsSentForBreach = false;
 uint8_t currentPwmDuty = 0;
 TickType_t xLastActivityTime = 0;
-volatile uint8_t lastAppliedSeq = SEQ_NONE;
 
-// Dynamic GSM Subscribers List
 char subscribers[MAX_SUBSCRIBERS][PHONE_LEN];
 uint8_t subscriberCount = 0;
 
-// --- Helper Functions: Persistent GSM Subscriber Storage ---
+// --- Helper Functions for GSM NVS Management ---
 void loadSubscribers() {
   preferences.begin("gsm_subs", true);
   subscriberCount = preferences.getUChar("count", 0);
-  for (uint8_t i = 0; i < subscriberCount; i++) {
-    String key = "sub" + String(i);
-    String num = preferences.getString(key.c_str(), "");
-    strncpy(subscribers[i], num.c_str(), PHONE_LEN - 1);
-  }
-  preferences.end();
-}
-
-bool addSubscriber(const char* phone) {
-  if (subscriberCount >= MAX_SUBSCRIBERS) return false;
-  for (uint8_t i = 0; i < subscriberCount; i++) {
-    if (strcmp(subscribers[i], phone) == 0) return true;
-  }
-  strncpy(subscribers[subscriberCount], phone, PHONE_LEN - 1);
-  subscriberCount++;
-
-  preferences.begin("gsm_subs", false);
-  preferences.putUChar("count", subscriberCount);
-  String key = "sub" + String(subscriberCount - 1);
-  preferences.putString(key.c_str(), phone);
-  preferences.end();
-  return true;
-}
-
-bool removeSubscriber(const char* phone) {
-  int foundIdx = -1;
-  for (uint8_t i = 0; i < subscriberCount; i++) {
-    if (strcmp(subscribers[i], phone) == 0) {
-      foundIdx = i;
-      break;
+  
+  if (subscriberCount == 0) {
+    strncpy(subscribers[0], TARGET_PHONE_NUM, PHONE_LEN - 1);
+    subscribers[0][PHONE_LEN - 1] = '\0';
+    subscriberCount = 1;
+  } else {
+    for (uint8_t i = 0; i < subscriberCount; i++) {
+      String key = "sub" + String(i);
+      String num = preferences.getString(key.c_str(), "");
+      strncpy(subscribers[i], num.c_str(), PHONE_LEN - 1);
+      subscribers[i][PHONE_LEN - 1] = '\0';
     }
   }
-  if (foundIdx == -1) return false;
+  preferences.end();
+}
 
-  for (uint8_t i = foundIdx; i < subscriberCount - 1; i++) {
-    strcpy(subscribers[i], subscribers[i + 1]);
+bool addSubscriberNVS(const char* newPhone) {
+  if (subscriberCount >= MAX_SUBSCRIBERS) return false;
+
+  for (uint8_t i = 0; i < subscriberCount; i++) {
+    if (strcmp(subscribers[i], newPhone) == 0) return true;
   }
-  subscriberCount--;
 
   preferences.begin("gsm_subs", false);
-  preferences.clear();
+  String key = "sub" + String(subscriberCount);
+  preferences.putString(key.c_str(), newPhone);
+  strncpy(subscribers[subscriberCount], newPhone, PHONE_LEN - 1);
+  subscribers[subscriberCount][PHONE_LEN - 1] = '\0';
+  
+  subscriberCount++;
   preferences.putUChar("count", subscriberCount);
-  for (uint8_t i = 0; i < subscriberCount; i++) {
-    String key = "sub" + String(i);
-    preferences.putString(key.c_str(), subscribers[i]);
-  }
   preferences.end();
+  
+  Serial.printf("[GSM NVS] Added subscriber #%d: %s\n", subscriberCount, newPhone);
   return true;
 }
 
-// --- Thread-Safe Inactivity Tracking ---
+void clearSubscribersNVS() {
+  preferences.begin("gsm_subs", false);
+  preferences.clear();
+  preferences.putUChar("count", 0);
+  preferences.end();
+  
+  subscriberCount = 0;
+  Serial.println(F("[GSM NVS] Cleared all subscriber entries."));
+}
+
 void resetInactivityTimer() {
   if (xActivityMutex != NULL && xSemaphoreTake(xActivityMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
     xLastActivityTime = xTaskGetTickCount();
@@ -178,11 +175,16 @@ void setSystemModeAtomic(EventBits_t targetModeBit) {
   resetInactivityTimer();
 }
 
-// --- TinyML Initialization ---
 void initTinyML() {
   static tflite::MicroErrorReporter microErrorReporter;
   errorReporter = &microErrorReporter;
+  
+#ifdef g_model_data
+  model = tflite::GetModel(g_model_data);
+#else
   model = tflite::GetModel(g_model);
+#endif
+
   if (model->version() != TFLITE_SCHEMA_VERSION) return;
 
   static tflite::AllOpsResolver resolver;
@@ -195,7 +197,6 @@ void initTinyML() {
   output = interpreter->output(0);
 }
 
-// --- Actuator Management & Sleep Procedures ---
 void stopActuators() {
   currentPwmDuty = 0;
   ledcWrite(PUMP_PWM_CHANNEL, 0);
@@ -203,18 +204,111 @@ void stopActuators() {
 }
 
 void triggerDeepSleep() {
+  Serial.println(F("[POWER] Toggling Power State -> OFF. Entering Deep Sleep..."));
+  Serial.flush();
+
+  sysPowerState = false;
+
+  // 1. Delete tasks to release core interfaces
+  vTaskDelete(xTaskGetHandle("LoRaTask"));
+  vTaskDelete(xTaskGetHandle("SystemEngine"));
+  vTaskDelete(xTaskGetHandle("GSM_Task"));
+  vTaskDelete(xTaskGetHandle("ButtonTask"));
+
+  // 2. Put SX127x into Continuous Receive Mode (DIO0 will fire RxDone HIGH on full packet)
+  if (xSpiMutex != NULL && xSemaphoreTake(xSpiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+ 
+    LoRa.receive(); // Active Continuous RX
+    xSemaphoreGive(xSpiMutex);
+  }
+
+  // 3. Turn off local status indicators and actuators
   digitalWrite(GREEN_LED, LOW);
   digitalWrite(YELLOW_LED, LOW);
   digitalWrite(RED_LED, LOW);
   digitalWrite(BUZZER_PIN, LOW);
   stopActuators();
 
-  esp_sleep_enable_timer_wakeup(SLEEP_TIMER_US);
-  Serial.flush();
+  // 4. Wait for physical power button release if physically pressed
+  pinMode(POWER_BUTTON, INPUT_PULLUP);
+  while (digitalRead(POWER_BUTTON) == LOW) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  vTaskDelay(pdMS_TO_TICKS(150));
+
+  // 5. Radio Wakeup via RTC EXT0 exclusively on LORA_DIO0_PIN (Active HIGH)
+  #if defined(LORA_DIO0_PIN) && (LORA_DIO0_PIN >= 0)
+  rtc_gpio_init((gpio_num_t)LORA_DIO0_PIN);
+  rtc_gpio_set_direction((gpio_num_t)LORA_DIO0_PIN, RTC_GPIO_MODE_INPUT_ONLY);
+  gpio_pullup_dis((gpio_num_t)LORA_DIO0_PIN);
+  gpio_pulldown_en((gpio_num_t)LORA_DIO0_PIN); // Ensure line stays pulled down until RxDone
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)LORA_DIO0_PIN, 1);
+  #endif
+
+  // 6. Power Button Wakeup via RTC EXT1 on POWER_BUTTON (GPIO 15)
+  rtc_gpio_init((gpio_num_t)POWER_BUTTON);
+  rtc_gpio_set_direction((gpio_num_t)POWER_BUTTON, RTC_GPIO_MODE_INPUT_ONLY);
+  rtc_gpio_pullup_en((gpio_num_t)POWER_BUTTON);
+  rtc_gpio_pulldown_dis((gpio_num_t)POWER_BUTTON);
+  esp_sleep_enable_ext1_wakeup(BUTTON_WAKEUP_MASK, ESP_EXT1_WAKEUP_ALL_LOW);
+
   esp_deep_sleep_start();
 }
+void checkWakeupReason() {
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  switch (wakeup_reason) {
+    case ESP_SLEEP_WAKEUP_EXT0: 
+      Serial.println(F("[POWER] Wakeup Event: LoRa Radio Signal")); 
+      break;
+    case ESP_SLEEP_WAKEUP_EXT1: 
+      Serial.println(F("[POWER] Wakeup Event: Power Button Press (GPIO 15)")); 
+      break;
+    case ESP_SLEEP_WAKEUP_TIMER: 
+      Serial.println(F("[POWER] Wakeup Event: Scheduled Timer Cycle")); 
+      break;
+    default: 
+      Serial.println(F("[POWER] Cold Boot / Hardware Reset")); 
+      break;
+  }
+}
 
-// --- Task: Power Management ---
+// --- Task: Button Polling Task ---
+void vTaskButtonHandler(void *pvParameters) {
+  pinMode(MODE_BUTTON,  INPUT_PULLUP);
+  pinMode(POWER_BUTTON, INPUT_PULLUP);
+
+  // If boot occurred via GPIO 15 EXT1, block until button is completely released
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1) {
+    while (digitalRead(POWER_BUTTON) == LOW) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+
+  TickType_t lastDebounceTime = xTaskGetTickCount();
+  const TickType_t debounceDelay = pdMS_TO_TICKS(400);
+
+  for (;;) {
+    TickType_t now = xTaskGetTickCount();
+
+    if ((now - lastDebounceTime) > debounceDelay) {
+      if (digitalRead(MODE_BUTTON) == LOW) {
+        SystemCommandType sysCmd = CMD_TOGGLE_MODE;
+        xQueueSend(systemCmdQueue, &sysCmd, 0);
+        Serial.println(F("[BUTTON] MODE Toggle Pressed"));
+        lastDebounceTime = now;
+      } 
+      else if (digitalRead(POWER_BUTTON) == LOW) {
+        SystemCommandType sysCmd = CMD_TRIGGER_SLEEP;
+        xQueueSend(systemCmdQueue, &sysCmd, 0);
+        Serial.println(F("[BUTTON] POWER Button Pressed"));
+        lastDebounceTime = now;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
 void vTaskPowerManagement(void *pvParameters) {
   resetInactivityTimer();
   const TickType_t xAwakeTimeoutTicks = pdMS_TO_TICKS(AWAKE_INTERVAL_SEC * 1000);
@@ -227,7 +321,6 @@ void vTaskPowerManagement(void *pvParameters) {
     TickType_t xCurrentTicks = xTaskGetTickCount();
     if ((xCurrentTicks - getLastActivityTime()) >= xAwakeTimeoutTicks) {
       EventBits_t currentBits = xEventGroupGetBits(xSystemEvents);
-
       bool isBreached = (currentBits & THRESHOLD_BREACH_BIT) != 0;
       bool isOverride = (currentBits & MODE_OVERRIDE_BIT) != 0;
 
@@ -240,134 +333,95 @@ void vTaskPowerManagement(void *pvParameters) {
   }
 }
 
-// --- Task: Bi-Directional LoRa Engine ---
+// --- Task: Dedicated Async LoRa Queue Engine ---
 void vTaskLoRaEngine(void *pvParameters) {
-  Serial.println("[LoRa] Initializing SPI & SX127x Module...");
-  SPI.begin(LORA_SCK_PIN, LORA_MISO_PIN, LORA_MOSI_PIN, LORA_CS_PIN);
-  LoRa.setPins(LORA_CS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
+  Serial.println(F("[LoRa] Initializing SPI & Radio setup..."));
+  
+  if (xSpiMutex != NULL && xSemaphoreTake(xSpiMutex, portMAX_DELAY) == pdTRUE) {
+    SPI.begin(LORA_SCK_PIN, LORA_MISO_PIN, LORA_MOSI_PIN, LORA_CS_PIN);
+    LoRa.setPins(LORA_CS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
 
-  if (!LoRa.begin(LORA_FREQ_HZ)) {
-    Serial.println("[LoRa ERROR] Initialization Failed! Check wiring & power.");
-    vTaskDelete(NULL);
+    if (!LoRa.begin(LORA_FREQ)) {
+      Serial.println(F("[LoRa ERROR] Transceiver Initialization Failed!"));
+      xSemaphoreGive(xSpiMutex);
+      vTaskDelete(NULL);
+    }
+
+    LoRa.setSpreadingFactor(7);
+    LoRa.setSignalBandwidth(125E3);
+    LoRa.setCodingRate4(5);
+    LoRa.enableCrc();
+    LoRa.receive();
+    xSemaphoreGive(xSpiMutex);
   }
 
-  LoRa.setSpreadingFactor(LORA_SPREADING_FACTOR);
-  LoRa.setSignalBandwidth(LORA_BANDWIDTH_HZ);
-  LoRa.setCodingRate4(LORA_CODING_RATE);
-  LoRa.enableCrc();
-
-  Serial.println("[LoRa SUCCESS] Transceiver Ready @ 868MHz");
-
-  TickType_t xLastTx = xTaskGetTickCount();
+  Serial.println(F("[LoRa SUCCESS] Transceiver Listening..."));
+  char outboundPayload[160];
 
   for (;;) {
-    // --- RECEIVE ENGINE ---
-    int packetSize = LoRa.parsePacket();
-    if (packetSize) {
-      resetInactivityTimer();
-      String payload = "";
-      while (LoRa.available()) payload += (char)LoRa.read();
+    if (xSpiMutex != NULL && xSemaphoreTake(xSpiMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+      
+      // 1. Process RX
+      int packetSize = LoRa.parsePacket();
+      if (packetSize > 0) {
+        resetInactivityTimer();
+        String payload = "";
+        payload.reserve(packetSize);
+        while (LoRa.available()) payload += (char)LoRa.read();
 
-      int rssi = LoRa.packetRssi();
-      float snr = LoRa.packetSnr();
+        JsonDocument doc;
+        DeserializationError err = deserializeJson(doc, payload);
 
-      Serial.println("\n------------------ LORA RX ------------------");
-      Serial.printf("[LoRa RX] Bytes: %d | RSSI: %d dBm | SNR: %.2f dB\n", packetSize, rssi, snr);
-      Serial.printf("[LoRa RX] Payload: %s\n", payload.c_str());
+        if (!err && doc["cmd"].is<const char*>()) {
+          const char* cmd = doc["cmd"];
+          const char* val = doc["val"] | "";
 
-      JsonDocument doc;
-      DeserializationError err = deserializeJson(doc, payload);
+          Serial.printf("[LoRa RX] Cmd: '%s' | Val: '%s'\n", cmd, val);
 
-      if (err) {
-        Serial.printf("[LoRa RX ERROR] JSON Parsing Failed: %s\n", err.c_str());
-      } else {
-        if (doc[K_CMD].is<const char*>()) {
-          const char* cmd = doc[K_CMD];
-          const char* val = doc[K_VAL] | "";
-          uint8_t seq    = doc[K_SEQ] | SEQ_NONE;
-
-          Serial.printf("[LoRa RX CMD] '%s' | '%s' | seq=%u\n", cmd, val, seq);
-
-          SystemCommand sysCmd;
-          sysCmd.seq = seq;
-          bool recognised = true;
-
-          if (strcmp(cmd, CMD_SET_MODE) == 0) {
-            // Legacy spellings are still accepted so a half-flashed pair keeps
-            // working during a rolling upgrade. Remove once both ends are on
-            // protocol v2.
-            if (strcmp(val, VAL_MANUAL) == 0 ||
-                strcmp(val, "GUARDIAN") == 0 || strcmp(val, "OVERRIDE") == 0) {
-              sysCmd.type = CMD_SET_MODE_OVERRIDE;
-              Serial.println("[LoRa ACTION] -> MANUAL override");
-            } else if (strcmp(val, VAL_AUTO) == 0 ||
-                       strcmp(val, "MONITOR") == 0 || strcmp(val, "INSPECT") == 0) {
-              sysCmd.type = CMD_SET_MODE_INSPECT;
-              Serial.println("[LoRa ACTION] -> AUTO");
-            } else {
-              recognised = false;
-              Serial.printf("[LoRa WARN] Unknown SET_MODE value: %s\n", val);
+          if (strcmp(cmd, "SET_MODE") == 0) {
+            SystemCommandType sysCmd;
+            if (strcmp(val, "GUARDIAN") == 0 || strcmp(val, "OVERRIDE") == 0) {
+              sysCmd = CMD_SET_MODE_OVERRIDE;
+              xQueueSend(systemCmdQueue, &sysCmd, 0);
+            } else if (strcmp(val, "MONITOR") == 0 || strcmp(val, "INSPECT") == 0) {
+              sysCmd = CMD_SET_MODE_INSPECT;
+              xQueueSend(systemCmdQueue, &sysCmd, 0);
             }
-          } else if (strcmp(cmd, CMD_POWER) == 0 &&
-                     (strcmp(val, VAL_SLEEP) == 0 ||
-                      strcmp(val, "TOGGLE") == 0 || strcmp(val, "OFF") == 0)) {
-            sysCmd.type = CMD_TRIGGER_SLEEP;
-            Serial.println("[LoRa ACTION] -> SLEEP");
-          } else {
-            recognised = false;
-            Serial.printf("[LoRa WARN] Unhandled Command Key: %s\n", cmd);
+          } 
+          else if (strcmp(cmd, "POWER") == 0 && (strcmp(val, "TOGGLE") == 0 || strcmp(val, "OFF") == 0)) {
+            SystemCommandType sysCmd = CMD_TRIGGER_SLEEP;
+            xQueueSend(systemCmdQueue, &sysCmd, 0);
           }
-
-          if (recognised) xQueueSend(systemCmdQueue, &sysCmd, 0);
-        } else {
-          Serial.println("[LoRa RX WARN] Valid JSON, but missing 'cmd' string key");
+          else if (strcmp(cmd, "GSM_SEND_SMS") == 0 && strlen(val) > 0) {
+            char smsBuf[160];
+            snprintf(smsBuf, sizeof(smsBuf), "[REMOTE LORA] %s", val);
+            xQueueSend(gsmQueue, &smsBuf, 0);
+          }
+          else if (strcmp(cmd, "GSM_ADD_SUB") == 0 && strlen(val) > 0) {
+            addSubscriberNVS(val);
+          }
+          else if (strcmp(cmd, "GSM_CLEAR_SUBS") == 0) {
+            clearSubscribersNVS();
+          }
         }
       }
-      Serial.println("---------------------------------------------\n");
-    }
 
-    // --- TRANSMIT TELEMETRY ENGINE (Every 2s) ---
-    if ((xTaskGetTickCount() - xLastTx) >= pdMS_TO_TICKS(2000)) {
-      xLastTx = xTaskGetTickCount();
-
-      EventBits_t currentBits = xEventGroupGetBits(xSystemEvents);
-      bool isOverride = (currentBits & MODE_OVERRIDE_BIT) != 0;
-      bool isBreached = (currentBits & THRESHOLD_BREACH_BIT) != 0;
-
-      JsonDocument doc;
-      doc[K_TEMP] = latestMetrics.temp;
-      doc[K_HUM]  = latestMetrics.humidity;
-      doc[K_VOC]  = latestMetrics.voc;
-
-      // Two independent booleans rather than one overloaded "mode" string, so
-      // neither the ground station nor the dashboard has to infer one fact from
-      // the absence of another.
-      doc[K_MANUAL] = isOverride;
-      doc[K_BREACH] = isBreached;
-
-      // Echo the last command actually applied, so the sender can confirm
-      // delivery rather than guessing from a state change.
-      doc[K_ACK] = lastAppliedSeq;
-
-      char buffer[256];
-      size_t len = serializeJson(doc, buffer);
-
-      Serial.printf("[LoRa TX] Sending Telemetry (%d bytes): %s ... ", len, buffer);
-
-      LoRa.beginPacket();
-      LoRa.write((const uint8_t*)buffer, len);
-      if (LoRa.endPacket()) {
-        Serial.println("OK");
-      } else {
-        Serial.println("FAILED!");
+      // 2. Process Outbound Queue
+      if (xQueueReceive(loraTxQueue, &outboundPayload, 0) == pdTRUE) {
+        LoRa.idle();
+        LoRa.beginPacket();
+        LoRa.print(outboundPayload);
+        LoRa.endPacket();
+        LoRa.receive(); // Re-enable RX mode instantly
+        Serial.printf("[LoRa TX Outbound] Sent: %s\n", outboundPayload);
       }
-    }
 
+      xSemaphoreGive(xSpiMutex);
+    }
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
-// --- Task: GSM Engine ---
 void vTaskGSM(void *pvParameters) {
   resetInactivityTimer();
   gsmSerial.begin(9600, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
@@ -392,85 +446,126 @@ void vTaskGSM(void *pvParameters) {
         vTaskDelay(pdMS_TO_TICKS(3000));
       }
     }
-
-    if (gsmSerial.available()) {
-      String incoming = gsmSerial.readString();
-      incoming.trim();
-
-      if (incoming.indexOf("1") != -1) {
-        SystemCommand cmd = { CMD_SET_MODE_INSPECT, SEQ_NONE };
-        xQueueSend(systemCmdQueue, &cmd, 0);
-      } else if (incoming.indexOf("2") != -1) {
-        SystemCommand cmd = { CMD_SET_MODE_OVERRIDE, SEQ_NONE };
-        xQueueSend(systemCmdQueue, &cmd, 0);
-      } else if (incoming.indexOf("ADD:") != -1) {
-        int idx = incoming.indexOf("ADD:");
-        String phone = incoming.substring(idx + 4);
-        phone.trim();
-        addSubscriber(phone.c_str());
-      } else if (incoming.indexOf("REMOVE:") != -1) {
-        int idx = incoming.indexOf("REMOVE:");
-        String phone = incoming.substring(idx + 7);
-        phone.trim();
-        removeSubscriber(phone.c_str());
-      }
-    }
     vTaskDelay(pdMS_TO_TICKS(200));
   }
 }
 
-// --- Task: Central System Engine ---
 void vTaskSystemEngine(void *pvParameters) {
   TickType_t xLastDhtReadTime = xTaskGetTickCount();
+  TickType_t xLastTxWindow    = xTaskGetTickCount();
   const TickType_t xDhtInterval = pdMS_TO_TICKS(2000);
-  SystemCommand inboundCmd;
+  
+  SystemCommandType inboundCmd;
+
+  static float filteredTemp = -1.0f;
+  static float filteredHum  = -1.0f;
+  static float filteredVoc  = -1.0f;
+
+  static double tempSum = 0;
+  static double humSum  = 0;
+  static double vocSum  = 0;
+  static uint16_t samplesInWindow = 0;
 
   for (;;) {
     if (xQueueReceive(systemCmdQueue, &inboundCmd, 0) == pdTRUE) {
       resetInactivityTimer();
-      switch (inboundCmd.type) {
+      switch (inboundCmd) {
         case CMD_SET_MODE_INSPECT:
           setSystemModeAtomic(MODE_INSPECT_BIT);
           break;
+
         case CMD_SET_MODE_OVERRIDE:
           setSystemModeAtomic(MODE_OVERRIDE_BIT);
           break;
+
+        case CMD_TOGGLE_MODE: {
+          EventBits_t currentBits = xEventGroupGetBits(xSystemEvents);
+          if ((currentBits & MODE_OVERRIDE_BIT) != 0) {
+            setSystemModeAtomic(MODE_INSPECT_BIT);
+          } else {
+            setSystemModeAtomic(MODE_OVERRIDE_BIT);
+          }
+          break;
+        }
+
         case CMD_TRIGGER_SLEEP:
           if (xPowerSleepSemaphore != NULL) xSemaphoreGive(xPowerSleepSemaphore);
           break;
       }
-      // Recorded only once the command has actually been applied, so "ack"
-      // never claims more than the node has done.
-      if (inboundCmd.seq != SEQ_NONE) lastAppliedSeq = inboundCmd.seq;
     }
 
+    // --- Real-Time Sensor Processing ---
     TickType_t xNow = xTaskGetTickCount();
     if ((xNow - xLastDhtReadTime) >= xDhtInterval) {
       xLastDhtReadTime = xNow;
       float rawTemp = dht.readTemperature();
       float rawHum  = dht.readHumidity();
-      latestMetrics.temp = (isnan(rawTemp)) ? -1.0f : rawTemp;
-      latestMetrics.humidity = (isnan(rawHum)) ? -1.0f : rawHum;
+
+      if (!isnan(rawTemp)) {
+        filteredTemp = (filteredTemp < 0.0f) ? rawTemp : (EMA_ALPHA * rawTemp + (1.0f - EMA_ALPHA) * filteredTemp);
+      }
+      if (!isnan(rawHum)) {
+        filteredHum = (filteredHum < 0.0f) ? rawHum : (EMA_ALPHA * rawHum + (1.0f - EMA_ALPHA) * filteredHum);
+      }
     }
 
     int rawVoc = analogRead(MQ2_PIN);
-    latestMetrics.voc = (rawVoc < 0 || rawVoc > 4095) ? 0 : rawVoc;
+    if (rawVoc >= 0 && rawVoc <= 4095) {
+      filteredVoc = (filteredVoc < 0.0f) ? (float)rawVoc : (EMA_ALPHA * (float)rawVoc + (1.0f - EMA_ALPHA) * filteredVoc);
+    }
 
+    if (filteredTemp >= 0.0f && filteredHum >= 0.0f && filteredVoc >= 0.0f) {
+      tempSum += filteredTemp;
+      humSum  += filteredHum;
+      vocSum  += filteredVoc;
+      samplesInWindow++;
+    }
+
+    // --- Fast Telemetry Dispatch Queue Push ---
+    if ((xNow - xLastTxWindow) >= pdMS_TO_TICKS(TX_FAST_INTERVAL_MS)) {
+      xLastTxWindow = xNow;
+
+      if (samplesInWindow > 0) {
+        EventBits_t currentBits = xEventGroupGetBits(xSystemEvents);
+        bool isOverride = (currentBits & MODE_OVERRIDE_BIT) != 0;
+        bool isBreached = (currentBits & THRESHOLD_BREACH_BIT) != 0;
+
+        JsonDocument doc;
+        doc["temp"]     = (float)(tempSum / samplesInWindow);
+        doc["hum"]      = (float)(humSum / samplesInWindow);
+        doc["voc"]      = (int)(vocSum / samplesInWindow);
+        doc["samples"]  = samplesInWindow;
+        doc["mode"]     = isOverride ? "OVERRIDE" : (isBreached ? "GUARDIAN" : "MONITOR");
+        doc["breach"]   = isBreached;
+        doc["gsm_subs"] = subscriberCount;
+
+        char jsonBuffer[160];
+        serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
+
+        // Non-blocking write into the LoRa TX Queue
+        xQueueSend(loraTxQueue, &jsonBuffer, 0);
+
+        tempSum = 0; humSum = 0; vocSum = 0;
+        samplesInWindow = 0;
+      }
+    }
+
+    // --- TinyML Rule Logic ---
     bool breachDetected = false;
-    bool sensorsValid = (latestMetrics.temp >= 0.0f) && (latestMetrics.humidity >= 0.0f);
+    bool sensorsValid   = (filteredTemp >= 0.0f) && (filteredHum >= 0.0f);
 
     if (sensorsValid && interpreter != nullptr) {
-      input->data.f[0] = latestMetrics.temp / 100.0f;
-      input->data.f[1] = latestMetrics.humidity / 100.0f;
-      input->data.f[2] = (float)latestMetrics.voc / 4095.0f;
+      input->data.f[0] = filteredTemp / 100.0f;
+      input->data.f[1] = filteredHum / 100.0f;
+      input->data.f[2] = filteredVoc / 4095.0f;
 
       if (interpreter->Invoke() == kTfLiteOk) {
         if (output->data.f[1] > 0.75f) breachDetected = true;
       }
     } else {
-      if (latestMetrics.voc > VOC_THRESHOLD || 
-         (latestMetrics.temp > TEMP_THRESHOLD && latestMetrics.temp >= 0.0f) || 
-         (latestMetrics.humidity > HUM_THRESHOLD && latestMetrics.humidity >= 0.0f)) {
+      if (filteredVoc > VOC_THRESHOLD || 
+         (filteredTemp > TEMP_THRESHOLD && filteredTemp >= 0.0f) || 
+         (filteredHum > HUM_THRESHOLD && filteredHum >= 0.0f)) {
         breachDetected = true;
       }
     }
@@ -478,24 +573,24 @@ void vTaskSystemEngine(void *pvParameters) {
     if (breachDetected) xEventGroupSetBits(xSystemEvents, THRESHOLD_BREACH_BIT);
     else xEventGroupClearBits(xSystemEvents, THRESHOLD_BREACH_BIT);
 
+    // --- Actuator Management ---
     EventBits_t currentBits = xEventGroupGetBits(xSystemEvents);
     bool isOverride = (currentBits & MODE_OVERRIDE_BIT) != 0;
     bool isBreached = (currentBits & THRESHOLD_BREACH_BIT) != 0;
 
-    // --- State Machine Execution ---
     if (isOverride) {
-      // MANUAL OVERRIDE MODE (Forces full system activation)
       digitalWrite(GREEN_LED, LOW);
       digitalWrite(YELLOW_LED, HIGH);
       digitalWrite(RED_LED, LOW);
       digitalWrite(BUZZER_PIN, HIGH);
-
-      ledcWrite(PUMP_PWM_CHANNEL, 255);
-      if (FAN_PIN != -1) ledcWrite(FAN_PWM_CHANNEL, 255);
+      if (currentPwmDuty < 255) {
+        currentPwmDuty = (currentPwmDuty + 25 > 255) ? 255 : currentPwmDuty + 25;
+        ledcWrite(PUMP_PWM_CHANNEL, currentPwmDuty);
+        if (FAN_PIN != -1) ledcWrite(FAN_PWM_CHANNEL, currentPwmDuty);
+      }
       smsSentForBreach = false;
 
     } else if (isBreached) {
-      // GUARDIAN BREACH MODE (Environment triggers alarm & actuation ramp up)
       digitalWrite(GREEN_LED, LOW);
       digitalWrite(YELLOW_LED, LOW);
       digitalWrite(RED_LED, HIGH);
@@ -510,12 +605,11 @@ void vTaskSystemEngine(void *pvParameters) {
       if (!smsSentForBreach) {
         char msg[160];
         snprintf(msg, sizeof(msg), "ALARM BREACH!\r\nT:%.1fC H:%.1f%% VOC:%d",
-                 latestMetrics.temp, latestMetrics.humidity, latestMetrics.voc);
+                 filteredTemp, filteredHum, (int)filteredVoc);
         if (xQueueSend(gsmQueue, &msg, 0) == pdTRUE) smsSentForBreach = true;
       }
 
     } else {
-      // INSPECT / MONITOR MODE (Normal resting state)
       digitalWrite(GREEN_LED, HIGH);
       digitalWrite(YELLOW_LED, LOW);
       digitalWrite(RED_LED, LOW);
@@ -528,10 +622,25 @@ void vTaskSystemEngine(void *pvParameters) {
   }
 }
 
-// --- Setup ---
 void setup() {
   Serial.begin(115200);
 
+  rtc_gpio_deinit((gpio_num_t)POWER_BUTTON);
+  #if defined(LORA_DIO0_PIN) && (LORA_DIO0_PIN >= 0)
+  rtc_gpio_deinit((gpio_num_t)LORA_DIO0_PIN);
+  #endif
+  
+  esp_err_t err = nvs_flash_init();
+  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    err = nvs_flash_init();
+  }
+  ESP_ERROR_CHECK(err);
+
+  checkWakeupReason();
+  loadSubscribers();
+
+  checkWakeupReason();
   loadSubscribers();
 
   pinMode(GREEN_LED, OUTPUT);
@@ -539,29 +648,38 @@ void setup() {
   pinMode(RED_LED, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
 
+#if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
+  ledcAttachChannel(PUMP_PIN, PWM_FREQ, PWM_RES, PUMP_PWM_CHANNEL);
+  if (FAN_PIN != -1) ledcAttachChannel(FAN_PIN, PWM_FREQ, PWM_RES, FAN_PWM_CHANNEL);
+#else
   ledcSetup(PUMP_PWM_CHANNEL, PWM_FREQ, PWM_RES);
   ledcAttachPin(PUMP_PIN, PUMP_PWM_CHANNEL);
   if (FAN_PIN != -1) {
     ledcSetup(FAN_PWM_CHANNEL, PWM_FREQ, PWM_RES);
     ledcAttachPin(FAN_PIN, FAN_PWM_CHANNEL);
   }
+#endif
 
   xSystemEvents = xEventGroupCreate();
   xPowerSleepSemaphore = xSemaphoreCreateBinary();
   xActivityMutex = xSemaphoreCreateMutex();
-  gsmQueue = xQueueCreate(3, sizeof(char[160]));
-  systemCmdQueue = xQueueCreate(10, sizeof(SystemCommand));
+  xSpiMutex = xSemaphoreCreateMutex();  
+  
+  gsmQueue       = xQueueCreate(3, sizeof(char[160]));
+  systemCmdQueue = xQueueCreate(10, sizeof(SystemCommandType));
+  loraTxQueue    = xQueueCreate(5, sizeof(char[160]));
 
   setSystemModeAtomic(MODE_INSPECT_BIT);
 
   dht.begin();
   initTinyML();
 
-  // Task Pinning
-  xTaskCreatePinnedToCore(vTaskPowerManagement, "PowerTask", 2048, NULL, 3, NULL, 0);
-  xTaskCreatePinnedToCore(vTaskSystemEngine, "SystemEngine", 6144, NULL, 2, &xSystemEngineTaskHandle, 0);
-  xTaskCreatePinnedToCore(vTaskLoRaEngine, "LoRaTask", 8192, NULL, 2, NULL, 1);
-  xTaskCreatePinnedToCore(vTaskGSM, "GSM_Task", 3072, NULL, 1, NULL, 1);
+  // Task Initialization
+  xTaskCreatePinnedToCore(vTaskPowerManagement, "PowerTask",    3072,  NULL, 3, NULL, 0);
+  xTaskCreatePinnedToCore(vTaskButtonHandler,    "ButtonTask",   2048,  NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(vTaskSystemEngine,     "SystemEngine", 10240, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(vTaskLoRaEngine,       "LoRaTask",     8192,  NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(vTaskGSM,              "GSM_Task",      4096,  NULL, 1, NULL, 1);
 }
 
 void loop() {

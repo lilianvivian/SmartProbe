@@ -979,8 +979,15 @@ function normalize(raw) {
     soundAlarm:         pick(raw, "soundAlarm")
   };
   const breach = pick(raw, "breach");
+  // A v2 node states this outright. The deployed v1 node folds it into `mode`,
+  // where only "OVERRIDE" means manual — derive it so everything downstream
+  // reads one field regardless of which node is on the other end.
   r.manual = pick(raw, "manual");
-  r.ack    = pick(raw, "ack");
+  if (r.manual === undefined && raw.mode !== undefined)
+    r.manual = String(raw.mode).toUpperCase() === "OVERRIDE";
+  r.ack     = pick(raw, "ack");
+  r.samples = pick(raw, "samples");    // readings averaged into this packet
+  r.gsmSubs = pick(raw, "gsm_subs");   // SMS subscribers on the node
   r.gas    = pick(raw, "gas")    ?? gasLevel(r.voc);
   r.status = pick(raw, "status") ?? deriveStatus(r.mode, breach, r.manual);
   // v2 has no `mode` string; synthesise one for the Mode tile.

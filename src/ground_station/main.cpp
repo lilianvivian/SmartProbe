@@ -37,7 +37,9 @@ struct BaseStationState {
   float emaHum = 0.0;
   bool manual = false;          // node is in manual override
   bool breach = false;          // node reports a threshold/ML breach
-  uint8_t ack = SEQ_NONE;       // last command seq the node applied
+  uint8_t ack = SEQ_NONE;       // last command seq the node applied (v2 only)
+  int samples = 0;              // readings averaged into the last packet
+  int gsmSubs = 0;              // SMS subscribers registered on the node
   bool lastDataValid = false;
   unsigned long lastRxTime = 0;
   unsigned int packets = 0;
@@ -60,6 +62,12 @@ static uint8_t inFlightSeq  = SEQ_NONE;   // SEQ_NONE => nothing awaiting ack
 static uint8_t retriesLeft  = 0;
 static unsigned long nextRetryAt = 0;
 static uint8_t lastSeqUsed  = SEQ_NONE;
+
+// The deployed node speaks v1 and sends no "ack", so confirmation falls back to
+// observing the state the command was supposed to produce. Recorded when a
+// command goes out; SLEEP has no observable end state and is not tracked.
+static bool inFlightExpectsManual = false;
+static bool inFlightObservable    = false;
 
 // Single entry point for both input sources, so a button press and a dashboard
 // click are indistinguishable downstream.
@@ -217,7 +225,11 @@ static void serviceRadio() {
       lastSeqUsed = protoNextSeq(lastSeqUsed);
       inFlightCmd = code;
       inFlightSeq = lastSeqUsed;
-      retriesLeft = MAX_RETRIES;
+      inFlightExpectsManual = (code == CMD_MANUAL);
+      // SLEEP produces no observable end state - the node simply stops
+      // transmitting - so it is sent once and never retried.
+      inFlightObservable = (code != CMD_SLEEP);
+      retriesLeft = (code == CMD_SLEEP) ? 0 : MAX_RETRIES;
       nextRetryAt = now + ACK_TIMEOUT_MS;
       transmitCommand(code, inFlightSeq);
       return;         // let parsePacket() re-arm RX on the next pass
@@ -261,20 +273,39 @@ static void serviceRadio() {
   if ((p = strstr(rxBuffer, "\"" K_VOC "\":")) != NULL)
     baseState.voc = atoi(p + sizeof(K_VOC) + 2);
 
-  // Two explicit booleans instead of one overloaded mode string: no inference.
-  if ((p = strstr(rxBuffer, "\"" K_MANUAL "\":")) != NULL)
-    baseState.manual = (strncmp(p + sizeof(K_MANUAL) + 2, "true", 4) == 0);
+  if ((p = strstr(rxBuffer, "\"" K_SAMPLES "\":")) != NULL)
+    baseState.samples = atoi(p + sizeof(K_SAMPLES) + 2);
+  if ((p = strstr(rxBuffer, "\"" K_GSM_SUBS "\":")) != NULL)
+    baseState.gsmSubs = atoi(p + sizeof(K_GSM_SUBS) + 2);
+
   if ((p = strstr(rxBuffer, "\"" K_BREACH "\":")) != NULL)
     baseState.breach = (strncmp(p + sizeof(K_BREACH) + 2, "true", 4) == 0);
 
-  // Acknowledgement closes the loop on the in-flight command.
+  // Prefer the explicit flag when a v2 node sends it; otherwise read it out of
+  // the overloaded v1 mode string, where only "OVERRIDE" means manual.
+  if ((p = strstr(rxBuffer, "\"" K_MANUAL "\":")) != NULL) {
+    baseState.manual = (strncmp(p + sizeof(K_MANUAL) + 2, "true", 4) == 0);
+  } else if ((p = strstr(rxBuffer, "\"" K_MODE "\":\"")) != NULL) {
+    baseState.manual = (strncmp(p + sizeof(K_MODE) + 3, MODE_MANUAL,
+                                sizeof(MODE_MANUAL) - 1) == 0);
+  }
+
+  // Close the loop on the in-flight command. A v2 node echoes the seq, which is
+  // definitive. The deployed v1 node does not, so fall back to observing that
+  // the node reached the state the command asked for.
+  bool confirmed = false;
+
   if ((p = strstr(rxBuffer, "\"" K_ACK "\":")) != NULL) {
     baseState.ack = (uint8_t)atoi(p + sizeof(K_ACK) + 2);
-    if (inFlightSeq != SEQ_NONE && baseState.ack == inFlightSeq) {
-      Serial.print(F("[ACK] seq="));
-      Serial.println(inFlightSeq);
-      inFlightSeq = SEQ_NONE;
-    }
+    confirmed = (inFlightSeq != SEQ_NONE && baseState.ack == inFlightSeq);
+  } else if (inFlightSeq != SEQ_NONE && inFlightObservable) {
+    confirmed = (baseState.manual == inFlightExpectsManual);
+  }
+
+  if (confirmed) {
+    Serial.print(F("[ACK] seq="));
+    Serial.println(inFlightSeq);
+    inFlightSeq = SEQ_NONE;
   }
 
   if (!baseState.lastDataValid) {

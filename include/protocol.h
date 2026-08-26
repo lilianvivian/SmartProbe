@@ -14,6 +14,7 @@
 // dashboard/index.html. Keep the two in step when changing anything here.
 // =============================================================================
 
+// v2 fields are emitted opportunistically; the deployed node speaks v1.
 #define PROTO_VERSION 2
 
 // --- Radio parameters -------------------------------------------------------
@@ -44,9 +45,19 @@
 #define CMD_SET_MODE "SET_MODE"
 #define CMD_POWER    "POWER"
 
-#define VAL_MANUAL   "MANUAL"
-#define VAL_AUTO     "AUTO"
-#define VAL_SLEEP    "SLEEP"
+// The wire values are the LEGACY spellings, because the deployed node
+// (lora_control @ eed816a) matches only those and silently discards anything
+// else — no fallback, no warning. The macro names describe what each actually
+// does, so the code stays readable while the packet stays compatible:
+//
+//   VAL_MANUAL -> "GUARDIAN"  forces buzzer, pump and fan to full output
+//   VAL_AUTO   -> "MONITOR"   resting state; automatic breach response runs
+//   VAL_SLEEP  -> "OFF"       begin the deep-sleep cycle early
+//
+// If the node ever adopts the clearer vocabulary, only these three lines change.
+#define VAL_MANUAL   "GUARDIAN"
+#define VAL_AUTO     "MONITOR"
+#define VAL_SLEEP    "OFF"
 
 // --- Telemetry message: node -> ground station ------------------------------
 //   {"temp":22.6,"hum":57,"voc":841,"manual":false,"breach":true,"ack":7}
@@ -58,9 +69,20 @@
 #define K_TEMP       "temp"
 #define K_HUM        "hum"
 #define K_VOC        "voc"
-#define K_MANUAL     "manual"   // manual override engaged
-#define K_BREACH     "breach"   // threshold or ML breach detected
-#define K_ACK        "ack"      // seq of the last command the node applied
+#define K_BREACH     "breach"     // threshold or ML breach detected
+#define K_SAMPLES    "samples"    // readings averaged into this packet
+#define K_GSM_SUBS   "gsm_subs"   // SMS subscribers registered on the node
+
+// The node currently reports state as one overloaded string: OVERRIDE when
+// manual, GUARDIAN when breached, MONITOR otherwise. Two facts in one field,
+// which is why anything downstream has to infer rather than read.
+#define K_MODE       "mode"
+#define MODE_MANUAL  "OVERRIDE"
+
+// Optional, emitted only by a node speaking v2. Everything downstream treats
+// these as "use if present, otherwise infer from K_MODE", so either node works.
+#define K_MANUAL     "manual"     // explicit manual-override flag
+#define K_ACK        "ack"        // seq of the last command the node applied
 
 // --- Command acknowledgement ------------------------------------------------
 // Every command carries a sequence number; the node echoes the last one it
