@@ -199,65 +199,6 @@
     </div>
   </div>
 
-  <!-- Command Reference Matrix -->
-  <div class="card">
-    <div class="card-title" style="margin-bottom: 10px;">Command Reference Matrix & LoRa Payload Protocol</div>
-    <table class="cmd-table">
-      <thead>
-        <tr>
-          <th>Serial Trigger</th>
-          <th>System Action</th>
-          <th>Outbound LoRa Frame Payload</th>
-          <th>Quick Test</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td><code>G</code></td>
-          <td>Change mode to GUARDIAN</td>
-          <td class="json-preview">{"cmd":"SET_MODE","val":"GUARDIAN"}</td>
-          <td><button class="btn btn-sm btn-dark" onclick="sendCmd('G')">Send</button></td>
-        </tr>
-        <tr>
-          <td><code>M</code></td>
-          <td>Change mode to MONITOR</td>
-          <td class="json-preview">{"cmd":"SET_MODE","val":"MONITOR"}</td>
-          <td><button class="btn btn-sm btn-dark" onclick="sendCmd('M')">Send</button></td>
-        </tr>
-        <tr>
-          <td><code>T</code></td>
-          <td>Toggle System Mode</td>
-          <td class="json-preview">{"cmd":"SET_MODE","val":"TOGGLE"}</td>
-          <td><button class="btn btn-sm btn-warn" onclick="sendCmd('T')">Send</button></td>
-        </tr>
-        <tr>
-          <td><code>P</code></td>
-          <td>Put ESP32 Node into Deep Sleep</td>
-          <td class="json-preview">{"cmd":"POWER","val":"OFF"}</td>
-          <td><button class="btn btn-sm btn-danger" onclick="sendCmd('P')">Send</button></td>
-        </tr>
-        <tr>
-          <td><code>C</code></td>
-          <td>Wipe subscribers list from ESP32 NVS</td>
-          <td class="json-preview">{"cmd":"GSM_CLEAR_SUBS","val":""}</td>
-          <td><button class="btn btn-sm btn-danger" onclick="sendCmd('C')">Send</button></td>
-        </tr>
-        <tr>
-          <td><code>ADD:+254712345678</code></td>
-          <td>Save subscriber to ESP32 NVS</td>
-          <td class="json-preview">{"cmd":"GSM_ADD_SUB","val":"+254712345678"}</td>
-          <td><button class="btn btn-sm" onclick="sendParamCmd('ADD:', 'gsm-phone')">Send</button></td>
-        </tr>
-        <tr>
-          <td><code>SMS:Gas Breach Alert</code></td>
-          <td>Transmit SMS notification alert</td>
-          <td class="json-preview">{"cmd":"GSM_SEND_SMS","val":"Gas Breach Alert"}</td>
-          <td><button class="btn btn-sm" onclick="sendParamCmd('SMS:', 'gsm-sms')">Send</button></td>
-        </tr>
-      </tbody>
-    </table>
-  </div>
-
   <script>
     let port, reader, writer;
     const decoder = new TextDecoder();

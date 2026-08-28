@@ -3,15 +3,14 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 
-// --- Pin Configurations ---
-#define LORA_CS     10
-#define LORA_RST    9
-#define LORA_DIO0   2
-#define BTN_POWER   7  // Wire switch between Pin 4 and GND
+#define LORA_CS          10
+#define LORA_RST         9
+#define LORA_DIO0        2
+#define BTN_POWER        7  
 
-#define LORA_FREQ         868E6
-#define DEBOUNCE_MS       50
-#define DISPLAY_INTERVAL  400
+#define LORA_FREQ        868E6
+#define DEBOUNCE_MS      50
+#define DISPLAY_INTERVAL 400
 
 struct BaseStationState {
   float temp = 0.0;
@@ -33,24 +32,36 @@ struct BaseStationState {
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 BaseStationState baseState;
 
-// Variable tracking for button state machine
 bool buttonWasPressed = false;
 unsigned long pressStartTime = 0;
 unsigned long lastDisplayUpdate = 0;
 
-// Direct LoRa Transmission Helper
-void sendLoRaCommand(const char* payload) {
-  Serial.print(F("[LORA TX] Transmitting: "));
+// Hardware Error Guarded TX Function
+bool sendLoRaCommand(const char* payload) {
+  if (payload == NULL || strlen(payload) == 0) {
+    Serial.println(F("[ERROR] Attempted to transmit NULL/Empty payload"));
+    return false;
+  }
+
+  Serial.print(F("[LORA TX] "));
   Serial.println(payload);
 
   LoRa.idle();
-  LoRa.beginPacket();
+  if (!LoRa.beginPacket()) {
+    Serial.println(F("[ERROR] Failed to start LoRa packet transmission"));
+    return false;
+  }
+  
   LoRa.print(payload);
-  LoRa.endPacket();
+  
+  if (!LoRa.endPacket()) {
+    Serial.println(F("[ERROR] LoRa Packet Transmission Failed"));
+    return false;
+  }
   
   delay(10);
   LoRa.receive();
-  Serial.println(F("[LORA TX] Complete. Radio in RX mode."));
+  return true;
 }
 
 void handleButton() {
@@ -60,21 +71,11 @@ void handleButton() {
   if (isPressed && !buttonWasPressed) {
     buttonWasPressed = true;
     pressStartTime = now;
-    Serial.println(F("[BTN] Pin 4 Pressed (LOW detected)"));
   } 
   else if (!isPressed && buttonWasPressed) {
     buttonWasPressed = false;
-    unsigned long duration = now - pressStartTime;
-
-    Serial.print(F("[BTN] Pin 4 Released. Hold duration: "));
-    Serial.print(duration);
-    Serial.println(F(" ms"));
-
-    if (duration >= DEBOUNCE_MS) {
-      Serial.println(F("[BTN LOGIC] Valid Press. Sending POWER OFF..."));
+    if ((now - pressStartTime) >= DEBOUNCE_MS) {
       sendLoRaCommand("{\"cmd\":\"POWER\",\"val\":\"OFF\"}");
-    } else {
-      Serial.println(F("[BTN LOGIC] Ignored as noise/bounce (<50ms)."));
     }
   }
 }
@@ -83,6 +84,7 @@ void handleSerialCommands() {
   if (!Serial.available()) return;
   
   char buf[32];
+  // Safe buffer bounded read
   uint8_t len = Serial.readBytesUntil('\n', buf, sizeof(buf) - 1);
   buf[len] = '\0';
   
@@ -90,9 +92,6 @@ void handleSerialCommands() {
     buf[--len] = '\0';
   }
   if (len == 0) return;
-
-  Serial.print(F("[SERIAL IN] Command received: "));
-  Serial.println(buf);
 
   if (strcmp(buf, "G") == 0) {
     sendLoRaCommand("{\"cmd\":\"SET_MODE\",\"val\":\"GUARDIAN\"}");
@@ -106,95 +105,98 @@ void handleSerialCommands() {
     sendLoRaCommand("{\"cmd\":\"GSM_CLEAR_SUBS\",\"val\":\"\"}");
   } else if (strncmp(buf, "ADD:", 4) == 0) {
     char cmdBuf[48];
-    snprintf(cmdBuf, sizeof(cmdBuf), "{\"cmd\":\"GSM_ADD_SUB\",\"val\":\"%s\"}", buf + 4);
-    sendLoRaCommand(cmdBuf);
+    int written = snprintf(cmdBuf, sizeof(cmdBuf), "{\"cmd\":\"GSM_ADD_SUB\",\"val\":\"%s\"}", buf + 4);
+    if (written > 0 && written < (int)sizeof(cmdBuf)) {
+      sendLoRaCommand(cmdBuf);
+    } else {
+      Serial.println(F("[ERROR] ADD: Buffer overflow prevented"));
+    }
   } else if (strncmp(buf, "SMS:", 4) == 0) {
     char cmdBuf[48];
-    snprintf(cmdBuf, sizeof(cmdBuf), "{\"cmd\":\"GSM_SEND_SMS\",\"val\":\"%s\"}", buf + 4);
-    sendLoRaCommand(cmdBuf);
-  } else {
-    Serial.print(F("[CMD ERR] Unknown command format: "));
-    Serial.println(buf);
+    int written = snprintf(cmdBuf, sizeof(cmdBuf), "{\"cmd\":\"GSM_SEND_SMS\",\"val\":\"%s\"}", buf + 4);
+    if (written > 0 && written < (int)sizeof(cmdBuf)) {
+      sendLoRaCommand(cmdBuf);
+    } else {
+      Serial.println(F("[ERROR] SMS: Buffer overflow prevented"));
+    }
   }
 }
 
 void handleLoRaRx() {
-  static char rxBuffer[100];
+  static char rxBuffer[128];
   int packetSize = LoRa.parsePacket();
 
-  if (packetSize > 0) {
-    Serial.print(F("\n[LORA RX] Packet received! Size: "));
-    Serial.print(packetSize);
-    Serial.println(F(" bytes."));
+  if (packetSize <= 0) return;
 
-    int bytesRead = 0;
-    while (LoRa.available() && bytesRead < (sizeof(rxBuffer) - 1)) {
-      rxBuffer[bytesRead++] = (char)LoRa.read();
-    }
-    rxBuffer[bytesRead] = '\0';
+  int bytesRead = 0;
+  while (LoRa.available() && bytesRead < (sizeof(rxBuffer) - 1)) {
+    rxBuffer[bytesRead++] = (char)LoRa.read();
+  }
+  rxBuffer[bytesRead] = '\0';
 
-    baseState.packets++;
+  // Guard against truncated or zero-length packets
+  if (bytesRead == 0) return;
 
-    // Print JSON output for Web Dashboard
-    if (bytesRead > 1 && rxBuffer[bytesRead - 1] == '}') {
-      Serial.write((const uint8_t *)rxBuffer, bytesRead - 1);
-      Serial.print(F(",\"rssi\":"));    Serial.print(LoRa.packetRssi());
-      Serial.print(F(",\"snr\":"));     Serial.print(LoRa.packetSnr(), 1);
-      Serial.print(F(",\"packets\":")); Serial.print(baseState.packets);
-      Serial.println('}');
-    } else {
-      Serial.print(F("[LORA RX RAW] "));
-      Serial.println(rxBuffer);
-    }
+  baseState.packets++;
 
-    char *tempPtr   = strstr(rxBuffer, "\"temp\":");
-    char *humPtr    = strstr(rxBuffer, "\"hum\":");
-    char *vocPtr    = strstr(rxBuffer, "\"voc\":");
-    char *sampPtr   = strstr(rxBuffer, "\"samples\":");
-    char *modePtr   = strstr(rxBuffer, "\"mode\":");
-    char *breachPtr = strstr(rxBuffer, "\"breach\":");
-    char *gsmSubPtr = strstr(rxBuffer, "\"gsm_subs\":");
+  // Output to Serial Web Dashboard pipeline safely
+  if (bytesRead > 1 && rxBuffer[bytesRead - 1] == '}') {
+    Serial.write((const uint8_t *)rxBuffer, bytesRead - 1);
+    Serial.print(F(",\"rssi\":"));    Serial.print(LoRa.packetRssi());
+    Serial.print(F(",\"snr\":"));     Serial.print(LoRa.packetSnr(), 1);
+    Serial.print(F(",\"packets\":")); Serial.print(baseState.packets);
+    Serial.println('}');
+  }
 
-    if (tempPtr != NULL) {
-      baseState.temp = atof(tempPtr + 7);
-      if (humPtr)    baseState.hum     = atof(humPtr + 6);
-      if (vocPtr)    baseState.voc     = atoi(vocPtr + 6);
-      if (sampPtr)   baseState.samples = atoi(sampPtr + 10);
-      if (breachPtr) baseState.breach  = (strstr(breachPtr + 9, "true") != NULL);
-      if (gsmSubPtr) baseState.gsmSubs = atoi(gsmSubPtr + 11);
+  // Safe Pointers with Defensive Bounds Checks
+  char *tempPtr   = strstr(rxBuffer, "\"temp\":");
+  char *humPtr    = strstr(rxBuffer, "\"hum\":");
+  char *vocPtr    = strstr(rxBuffer, "\"voc\":");
+  char *sampPtr   = strstr(rxBuffer, "\"samples\":");
+  char *modePtr   = strstr(rxBuffer, "\"mode\":");
+  char *breachPtr = strstr(rxBuffer, "\"breach\":");
+  char *gsmSubPtr = strstr(rxBuffer, "\"gsm_subs\":");
 
-      if (modePtr) {
-        char *modeStart = strchr(modePtr + 7, '"');
-        if (modeStart) {
-          modeStart++;
-          char *modeEnd = strchr(modeStart, '"');
-          if (modeEnd) {
-            size_t len = modeEnd - modeStart;
-            if (len < sizeof(baseState.mode)) {
-              strncpy(baseState.mode, modeStart, len);
-              baseState.mode[len] = '\0';
-            }
+  if (tempPtr != NULL) {
+    baseState.temp = atof(tempPtr + 7);
+    if (humPtr)    baseState.hum     = atof(humPtr + 6);
+    if (vocPtr)    baseState.voc     = atoi(vocPtr + 6);
+    if (sampPtr)   baseState.samples = atoi(sampPtr + 10);
+    if (breachPtr) baseState.breach  = (strstr(breachPtr + 9, "true") != NULL);
+    if (gsmSubPtr) baseState.gsmSubs = atoi(gsmSubPtr + 11);
+
+    if (modePtr != NULL) {
+      char *modeStart = strchr(modePtr + 7, '"');
+      if (modeStart != NULL) {
+        modeStart++;
+        char *modeEnd = strchr(modeStart, '"');
+        if (modeEnd != NULL && modeEnd > modeStart) {
+          size_t len = modeEnd - modeStart;
+          if (len < sizeof(baseState.mode)) {
+            strncpy(baseState.mode, modeStart, len);
+            baseState.mode[len] = '\0';
+          } else {
+            // Memory guard against long mode strings
+            strncpy(baseState.mode, modeStart, sizeof(baseState.mode) - 1);
+            baseState.mode[sizeof(baseState.mode) - 1] = '\0';
           }
         }
       }
-
-      if (!baseState.lastDataValid) {
-        baseState.emaTemp = baseState.temp;
-        baseState.emaHum  = baseState.hum;
-        baseState.emaVoc  = (float)baseState.voc;
-      } else {
-        baseState.emaTemp = (0.3f * baseState.temp) + (0.7f * baseState.emaTemp);
-        baseState.emaHum  = (0.3f * baseState.hum)  + (0.7f * baseState.emaHum);
-        baseState.emaVoc  = (0.3f * (float)baseState.voc) + (0.7f * baseState.emaVoc);
-      }
-
-      baseState.lastDataValid = true;
-      baseState.lastRxTime = millis();
-
-      Serial.print(F("[PARSER] Temp: ")); Serial.print(baseState.temp);
-      Serial.print(F("C | Hum: "));       Serial.print(baseState.hum);
-      Serial.print(F("% | VOC: "));       Serial.println(baseState.voc);
     }
+
+    // Exponential Moving Average (EMA) Calculation
+    if (!baseState.lastDataValid) {
+      baseState.emaTemp = baseState.temp;
+      baseState.emaHum  = baseState.hum;
+      baseState.emaVoc  = (float)baseState.voc;
+    } else {
+      baseState.emaTemp = (0.3f * baseState.temp) + (0.7f * baseState.emaTemp);
+      baseState.emaHum  = (0.3f * baseState.hum)  + (0.7f * baseState.emaHum);
+      baseState.emaVoc  = (0.3f * (float)baseState.voc) + (0.7f * baseState.emaVoc);
+    }
+
+    baseState.lastDataValid = true;
+    baseState.lastRxTime = millis();
   }
 }
 
@@ -210,15 +212,13 @@ void updateDisplay() {
     lcd.setCursor(0, 1);
     lcd.print(F("Waiting Data... "));
   } else {
-    // Line 1: Temp & Humidity
     lcd.setCursor(0, 0);
     lcd.print(F("T:"));
     lcd.print(baseState.emaTemp, 1);
     lcd.print(F("C H:"));
     lcd.print((int)baseState.emaHum);
-    lcd.print(F("%   "));
+    lcd.print(F("%    "));
 
-    // Line 2: VOC & System State
     lcd.setCursor(0, 1);
     if (baseState.breach) {
       lcd.print(F("V:"));
@@ -236,34 +236,46 @@ void updateDisplay() {
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial && millis() < 3000);
-
-  Serial.println(F("\n======================================"));
-  Serial.println(F("[SYS INIT] Ground Station (Single Loop)"));
-  Serial.println(F("======================================"));
-
   pinMode(BTN_POWER, INPUT_PULLUP);
 
+  // Initialize display with feedback
   lcd.init();
   lcd.backlight();
   lcd.clear();
   lcd.setCursor(0, 0);
   lcd.print(F("Ground Station"));
 
+  // Hardware Reset LoRa Transceiver
+  pinMode(LORA_RST, OUTPUT);
+  digitalWrite(LORA_RST, LOW);
+  delay(10);
+  digitalWrite(LORA_RST, HIGH);
+  delay(10);
+
+  // Error Trap: LoRa Hardware Initialization Check
   LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
   if (!LoRa.begin(LORA_FREQ)) {
-    Serial.println(F("[LORA ERR] Init Failed!"));
+    Serial.println(F("[FATAL] LoRa Initialization Failed!"));
     lcd.setCursor(0, 1);
     lcd.print(F("LoRa FAIL!"));
-    while (1);
+    
+    // Halt execution gracefully rather than allowing undefined behavior
+    while (1) {
+      delay(1000);
+    }
   }
 
+  // Radio Configuration
+  LoRa.setTxPower(17);
   LoRa.setSpreadingFactor(7);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5);
+  LoRa.setPreambleLength(8);
+  LoRa.setSyncWord(0x12);
   LoRa.enableCrc();
   LoRa.receive();
-  Serial.println(F("[SYS] Hardware initialization complete. Entering main loop..."));
+
+  Serial.println(F("[SYSTEM] Ground Station Ready. Ready for WebSerial connection."));
 }
 
 void loop() {
