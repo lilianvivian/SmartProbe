@@ -13,6 +13,7 @@
 #include <nvs_flash.h>
 #include <driver/rtc_io.h>
 
+// --- TinyML TensorFlow Lite Headers ---
 #include "tensorflow/lite/micro/all_ops_resolver.h"
 #include "tensorflow/lite/micro/micro_interpreter.h"
 #include "tensorflow/lite/micro/micro_error_reporter.h"
@@ -25,10 +26,32 @@
 #endif
 #endif
 
+// ===========================================================================
+// TELEMETRY CONTRACT (must stay in sync with ground_station.ino + dashboard.html)
+// ---------------------------------------------------------------------------
+// JSON keys sent over LoRa by this node:
+//   temp     : float  -- Celsius, or SENTINEL_INVALID_F (-999.0) if DHT invalid
+//   hum      : float  -- %RH,     or SENTINEL_INVALID_F (-999.0) if DHT invalid
+//   voc      : int    -- raw MQ2 EMA, or SENTINEL_INVALID_I (-1) if ADC invalid
+//   samples  : uint16 -- number of samples averaged this TX window
+//   mode     : string -- "MONITOR" | "GUARDIAN" | "OVERRIDE"
+//   breach   : bool   -- threshold/TinyML breach flag
+//   dht_err  : bool   -- true if temp/hum are currently invalid (DHT fault)
+//   gsm_subs : uint8  -- number of registered SMS subscribers
+//
+// Any consumer (ground station LCD, web dashboard) MUST treat temp/hum/voc
+// as "unknown" whenever dht_err is true / voc == -1, rather than displaying
+// the sentinel numbers directly.
+// ===========================================================================
+#define SENTINEL_INVALID_F   (-999.0f)
+#define SENTINEL_INVALID_I   (-1)
+
+// --- Configuration Constants ---
 #define PUMP_PWM_CHANNEL     0
 #define FAN_PWM_CHANNEL      1
 #define PWM_FREQ             1000
 #define PWM_RES              8
+
 #define LORA_FREQ            868E6
 
 #define MODE_INSPECT_BIT     (1UL << 0UL)
@@ -37,15 +60,19 @@
 #define ALL_MODES_MASK       (MODE_INSPECT_BIT | MODE_OVERRIDE_BIT)
 
 #define AWAKE_INTERVAL_SEC   (2 * 60)
-#define TX_FAST_INTERVAL_MS  5000 
+
+#define TX_FAST_INTERVAL_MS  5000
 #define EMA_ALPHA            0.2f
+
 #define MAX_SUBSCRIBERS      5
 #define PHONE_LEN            16
 
+// Deep-sleep wakeup mask ONLY for POWER_BUTTON (GPIO 15)
 #define BUTTON_WAKEUP_MASK   (1ULL << POWER_BUTTON)
 
 RTC_DATA_ATTR bool sysPowerState = true;
 
+// --- TinyML Arena ---
 namespace {
   tflite::ErrorReporter* errorReporter = nullptr;
   const tflite::Model* model = nullptr;
@@ -64,6 +91,7 @@ enum SystemCommandType {
   CMD_TRIGGER_SLEEP
 };
 
+// --- Global Objects ---
 DHT dht(DHT_PIN, DHT_TYPE);
 HardwareSerial gsmSerial(2);
 Preferences preferences;
@@ -84,39 +112,33 @@ bool isLoRaReady = false;
 char subscribers[MAX_SUBSCRIBERS][PHONE_LEN];
 uint8_t subscriberCount = 0;
 
+// --- Helper Functions for GSM NVS Management ---
 void loadSubscribers() {
   Serial.println(F("[NVS] Loading subscribers..."));
-  try {
-    if (!preferences.begin("gsm_subs", true)) {
-      Serial.println(F("[NVS ERROR] Failed to open Preferences namespace. Using defaults."));
-      strncpy(subscribers[0], TARGET_PHONE_NUM, PHONE_LEN - 1);
-      subscribers[0][PHONE_LEN - 1] = '\0';
-      subscriberCount = 1;
-      return;
-    }
-    
-    subscriberCount = preferences.getUChar("count", 0);
-    if (subscriberCount == 0) {
-      strncpy(subscribers[0], TARGET_PHONE_NUM, PHONE_LEN - 1);
-      subscribers[0][PHONE_LEN - 1] = '\0';
-      subscriberCount = 1;
-      Serial.printf("[NVS] No saved numbers. Default added: %s\n", subscribers[0]);
-    } else {
-      for (uint8_t i = 0; i < subscriberCount; i++) {
-        String key = "sub" + String(i);
-        String num = preferences.getString(key.c_str(), "");
-        strncpy(subscribers[i], num.c_str(), PHONE_LEN - 1);
-        subscribers[i][PHONE_LEN - 1] = '\0';
-        Serial.printf("[NVS] Sub [%d]: %s\n", i, subscribers[i]);
-      }
-    }
-    preferences.end();
-  } catch (...) {
-    Serial.println(F("[NVS CRITICAL] Exception thrown during subscriber read! Using fallback."));
+  if (!preferences.begin("gsm_subs", true)) {
+    Serial.println(F("[NVS ERROR] Failed to open Preferences namespace. Using defaults."));
     strncpy(subscribers[0], TARGET_PHONE_NUM, PHONE_LEN - 1);
     subscribers[0][PHONE_LEN - 1] = '\0';
     subscriberCount = 1;
+    return;
   }
+
+  subscriberCount = preferences.getUChar("count", 0);
+  if (subscriberCount == 0) {
+    strncpy(subscribers[0], TARGET_PHONE_NUM, PHONE_LEN - 1);
+    subscribers[0][PHONE_LEN - 1] = '\0';
+    subscriberCount = 1;
+    Serial.printf("[NVS] No saved numbers. Default added: %s\n", subscribers[0]);
+  } else {
+    for (uint8_t i = 0; i < subscriberCount; i++) {
+      String key = "sub" + String(i);
+      String num = preferences.getString(key.c_str(), "");
+      strncpy(subscribers[i], num.c_str(), PHONE_LEN - 1);
+      subscribers[i][PHONE_LEN - 1] = '\0';
+      Serial.printf("[NVS] Sub [%d]: %s\n", i, subscribers[i]);
+    }
+  }
+  preferences.end();
 }
 
 bool addSubscriberNVS(const char* newPhone) {
@@ -132,35 +154,30 @@ bool addSubscriberNVS(const char* newPhone) {
       return true;
     }
   }
-  try {
-    if (preferences.begin("gsm_subs", false)) {
-      String key = "sub" + String(subscriberCount);
-      preferences.putString(key.c_str(), newPhone);
-      strncpy(subscribers[subscriberCount], newPhone, PHONE_LEN - 1);
-      subscribers[subscriberCount][PHONE_LEN - 1] = '\0';
-      subscriberCount++;
-      preferences.putUChar("count", subscriberCount);
-      preferences.end();
-      Serial.printf("[NVS SUCCESS] Added sub #%d: %s\n", subscriberCount, newPhone);
-      return true;
-    }
-  } catch (...) {
-    Serial.println(F("[NVS ERROR] Exception during subscriber write operation."));
+  if (preferences.begin("gsm_subs", false)) {
+    String key = "sub" + String(subscriberCount);
+    preferences.putString(key.c_str(), newPhone);
+    strncpy(subscribers[subscriberCount], newPhone, PHONE_LEN - 1);
+    subscribers[subscriberCount][PHONE_LEN - 1] = '\0';
+    subscriberCount++;
+    preferences.putUChar("count", subscriberCount);
+    preferences.end();
+    Serial.printf("[NVS SUCCESS] Added sub #%d: %s\n", subscriberCount, newPhone);
+    return true;
   }
+  Serial.println(F("[NVS ERROR] Could not open namespace for write."));
   return false;
 }
 
 void clearSubscribersNVS() {
   Serial.println(F("[NVS] Clearing all saved subscribers..."));
-  try {
-    if (preferences.begin("gsm_subs", false)) {
-      preferences.clear();
-      preferences.putUChar("count", 0);
-      preferences.end();
-      subscriberCount = 0;
-      Serial.println(F("[NVS SUCCESS] Subscribers cleared."));
-    }
-  } catch (...) {
+  if (preferences.begin("gsm_subs", false)) {
+    preferences.clear();
+    preferences.putUChar("count", 0);
+    preferences.end();
+    subscriberCount = 0;
+    Serial.println(F("[NVS SUCCESS] Subscribers cleared."));
+  } else {
     Serial.println(F("[NVS ERROR] Failed to clear subscribers table."));
   }
 }
@@ -192,33 +209,29 @@ void setSystemModeAtomic(EventBits_t targetModeBit) {
 void initTinyML() {
   Serial.println(F("[TinyML] Initializing TensorFlow Lite Micro..."));
   isTinyMlReady = false;
-  try {
-    static tflite::MicroErrorReporter microErrorReporter;
-    errorReporter = &microErrorReporter;
-  #ifdef g_model_data
-    model = tflite::GetModel(g_model_data);
-  #else
-    model = tflite::GetModel(g_model);
-  #endif
-    if (model->version() != TFLITE_SCHEMA_VERSION) {
-      Serial.printf("[TinyML ERROR] Schema version mismatch! Expected %d, got %ld\n", TFLITE_SCHEMA_VERSION, model->version());
-      return;
-    }
-    static tflite::AllOpsResolver resolver;
-    static tflite::MicroInterpreter static_interpreter(model, resolver, tensorArena, kTensorArenaSize, errorReporter);
-    interpreter = &static_interpreter;
-    if (interpreter->AllocateTensors() != kTfLiteOk) {
-      Serial.println(F("[TinyML ERROR] Tensor allocation failed!"));
-      return;
-    }
-    input = interpreter->input(0);
-    output = interpreter->output(0);
-    isTinyMlReady = true;
-    Serial.println(F("[TinyML SUCCESS] Model loaded & Tensors allocated successfully."));
-  } catch (...) {
-    Serial.println(F("[TinyML CRITICAL] Internal exception during execution setup!"));
-    isTinyMlReady = false;
+
+  static tflite::MicroErrorReporter microErrorReporter;
+  errorReporter = &microErrorReporter;
+#ifdef g_model_data
+  model = tflite::GetModel(g_model_data);
+#else
+  model = tflite::GetModel(g_model);
+#endif
+  if (model->version() != TFLITE_SCHEMA_VERSION) {
+    Serial.printf("[TinyML ERROR] Schema version mismatch! Expected %d, got %ld\n", TFLITE_SCHEMA_VERSION, model->version());
+    return;
   }
+  static tflite::AllOpsResolver resolver;
+  static tflite::MicroInterpreter static_interpreter(model, resolver, tensorArena, kTensorArenaSize, errorReporter);
+  interpreter = &static_interpreter;
+  if (interpreter->AllocateTensors() != kTfLiteOk) {
+    Serial.println(F("[TinyML ERROR] Tensor allocation failed!"));
+    return;
+  }
+  input = interpreter->input(0);
+  output = interpreter->output(0);
+  isTinyMlReady = true;
+  Serial.println(F("[TinyML SUCCESS] Model loaded & Tensors allocated successfully."));
 }
 
 void stopActuators() {
@@ -233,6 +246,7 @@ void stopActuators() {
 void triggerDeepSleep() {
   Serial.println(F("[POWER] Shutdown initiated..."));
   Serial.flush();
+
   sysPowerState = false;
 
   vTaskDelete(xTaskGetHandle("LoRaTask"));
@@ -255,13 +269,13 @@ void triggerDeepSleep() {
   while (digitalRead(POWER_BUTTON) == LOW) { vTaskDelay(pdMS_TO_TICKS(10)); }
   vTaskDelay(pdMS_TO_TICKS(150));
 
-  #if defined(LORA_DIO0_PIN) && (LORA_DIO0_PIN >= 0)
+#if defined(LORA_DIO0_PIN) && (LORA_DIO0_PIN >= 0)
   rtc_gpio_init((gpio_num_t)LORA_DIO0_PIN);
   rtc_gpio_set_direction((gpio_num_t)LORA_DIO0_PIN, RTC_GPIO_MODE_INPUT_ONLY);
   gpio_pullup_dis((gpio_num_t)LORA_DIO0_PIN);
   gpio_pulldown_en((gpio_num_t)LORA_DIO0_PIN);
   esp_sleep_enable_ext0_wakeup((gpio_num_t)LORA_DIO0_PIN, 1);
-  #endif
+#endif
 
   rtc_gpio_init((gpio_num_t)POWER_BUTTON);
   rtc_gpio_set_direction((gpio_num_t)POWER_BUTTON, RTC_GPIO_MODE_INPUT_ONLY);
@@ -274,6 +288,25 @@ void triggerDeepSleep() {
   esp_deep_sleep_start();
 }
 
+void checkWakeupReason() {
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  switch (wakeup_reason) {
+    case ESP_SLEEP_WAKEUP_EXT0:
+      Serial.println(F("[POWER] Wakeup Event: LoRa Radio Signal"));
+      break;
+    case ESP_SLEEP_WAKEUP_EXT1:
+      Serial.println(F("[POWER] Wakeup Event: Power Button Press (GPIO 15)"));
+      break;
+    case ESP_SLEEP_WAKEUP_TIMER:
+      Serial.println(F("[POWER] Wakeup Event: Scheduled Timer Cycle"));
+      break;
+    default:
+      Serial.println(F("[POWER] Cold Boot / Hardware Reset"));
+      break;
+  }
+}
+
+// --- Task: Button Polling Task ---
 void vTaskButtonHandler(void *pvParameters) {
   Serial.println(F("[TASK] Button Task Started."));
   pinMode(MODE_BUTTON,  INPUT_PULLUP);
@@ -319,6 +352,7 @@ void vTaskPowerManagement(void *pvParameters) {
       Serial.println(F("[POWER] Sleep semaphore triggered. Shutting down..."));
       triggerDeepSleep();
     }
+
     if ((xTaskGetTickCount() - getLastActivityTime()) >= xAwakeTimeoutTicks) {
       EventBits_t bits = xEventGroupGetBits(xSystemEvents);
       if (!(bits & THRESHOLD_BREACH_BIT) && !(bits & MODE_OVERRIDE_BIT)) {
@@ -335,12 +369,14 @@ bool initLoRaRadio() {
   if (xSpiMutex != NULL && xSemaphoreTake(xSpiMutex, portMAX_DELAY) == pdTRUE) {
     SPI.begin(LORA_SCK_PIN, LORA_MISO_PIN, LORA_MOSI_PIN, LORA_CS_PIN);
     LoRa.setPins(LORA_CS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
+
     if (!LoRa.begin(LORA_FREQ)) {
       Serial.println(F("[LoRa ERROR] Radio Hardware Init Failed!"));
       isLoRaReady = false;
       xSemaphoreGive(xSpiMutex);
       return false;
     }
+
     LoRa.setSpreadingFactor(7);
     LoRa.setSignalBandwidth(125E3);
     LoRa.setCodingRate4(5);
@@ -373,68 +409,64 @@ void vTaskLoRaEngine(void *pvParameters) {
     // Outbound Transmit
     if (xQueueReceive(loraTxQueue, outboundPayload, 0) == pdTRUE) {
       if (xSpiMutex != NULL && xSemaphoreTake(xSpiMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
-        try {
-          Serial.printf("[LoRa TX START] Transmitting: %s\n", outboundPayload);
-          LoRa.idle();
-          LoRa.beginPacket();
+        Serial.printf("[LoRa TX START] Transmitting: %s\n", outboundPayload);
+        LoRa.idle();
+        if (LoRa.beginPacket()) {
           LoRa.print(outboundPayload);
           if (LoRa.endPacket()) {
             Serial.println(F("[LoRa TX COMPLETE] Packet dispatched successfully."));
           } else {
             Serial.println(F("[LoRa TX ERROR] Transmission write failed!"));
           }
-          LoRa.receive();
-        } catch (...) {
-          Serial.println(F("[LoRa TX EXCEPTION] Transmit operation failed safely."));
+        } else {
+          Serial.println(F("[LoRa TX ERROR] beginPacket() failed (radio busy?)"));
         }
+        LoRa.receive();
         xSemaphoreGive(xSpiMutex);
       }
     }
 
     // Inbound Receive
     if (xSpiMutex != NULL && xSemaphoreTake(xSpiMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-      try {
-        int packetSize = LoRa.parsePacket();
-        if (packetSize > 0) {
-          resetInactivityTimer();
-          String payload = "";
-          while (LoRa.available()) payload += (char)LoRa.read();
+      int packetSize = LoRa.parsePacket();
+      if (packetSize > 0) {
+        resetInactivityTimer();
+        String payload = "";
+        payload.reserve(packetSize);
+        while (LoRa.available()) payload += (char)LoRa.read();
+        Serial.printf("[LoRa RX] Received %d bytes (RSSI: %d, SNR: %.1f): %s\n",
+                      packetSize, LoRa.packetRssi(), LoRa.packetSnr(), payload.c_str());
 
-          Serial.printf("[LoRa RX] Received %d bytes (RSSI: %d, SNR: %.1f): %s\n", 
-                        packetSize, LoRa.packetRssi(), LoRa.packetSnr(), payload.c_str());
+        JsonDocument doc;
+        DeserializationError err = deserializeJson(doc, payload);
+        if (!err && doc["cmd"].is<const char*>()) {
+          const char* cmd = doc["cmd"];
+          const char* val = doc["val"] | "";
+          Serial.printf("[LoRa CMD] Parsed Command -> cmd: '%s', val: '%s'\n", cmd, val);
 
-          JsonDocument doc;
-          DeserializationError err = deserializeJson(doc, payload);
-
-          if (!err && doc["cmd"].is<const char*>()) {
-            const char* cmd = doc["cmd"];
-            const char* val = doc["val"] | "";
-            Serial.printf("[LoRa CMD] Parsed Command -> cmd: '%s', val: '%s'\n", cmd, val);
-
-            if (strcmp(cmd, "SET_MODE") == 0) {
-              SystemCommandType sysCmd = (strcmp(val, "GUARDIAN") == 0 || strcmp(val, "OVERRIDE") == 0) ? CMD_SET_MODE_OVERRIDE : CMD_SET_MODE_INSPECT;
-              xQueueSend(systemCmdQueue, &sysCmd, 0);
-            } else if (strcmp(cmd, "POWER") == 0 && (strcmp(val, "OFF") == 0 || strcmp(val, "TOGGLE") == 0)) {
-              SystemCommandType sysCmd = CMD_TRIGGER_SLEEP;
-              xQueueSend(systemCmdQueue, &sysCmd, 0);
-            } else if (strcmp(cmd, "GSM_SEND_SMS") == 0 && strlen(val) > 0) {
-              char smsBuf[160];
-              snprintf(smsBuf, sizeof(smsBuf), "[REMOTE] %s", val);
-              xQueueSend(gsmQueue, smsBuf, 0);
-            } else if (strcmp(cmd, "GSM_ADD_SUB") == 0 && strlen(val) > 0) {
-              addSubscriberNVS(val);
-            } else if (strcmp(cmd, "GSM_CLEAR_SUBS") == 0) {
-              clearSubscribersNVS();
-            }
-          } else if (err) {
-            Serial.printf("[LoRa RX ERROR] Deserialization failed: %s\n", err.c_str());
+          if (strcmp(cmd, "SET_MODE") == 0) {
+            SystemCommandType sysCmd = (strcmp(val, "GUARDIAN") == 0 || strcmp(val, "OVERRIDE") == 0)
+                                          ? CMD_SET_MODE_OVERRIDE : CMD_SET_MODE_INSPECT;
+            xQueueSend(systemCmdQueue, &sysCmd, 0);
+          } else if (strcmp(cmd, "POWER") == 0 && (strcmp(val, "OFF") == 0 || strcmp(val, "TOGGLE") == 0)) {
+            SystemCommandType sysCmd = CMD_TRIGGER_SLEEP;
+            xQueueSend(systemCmdQueue, &sysCmd, 0);
+          } else if (strcmp(cmd, "GSM_SEND_SMS") == 0 && strlen(val) > 0) {
+            char smsBuf[160];
+            snprintf(smsBuf, sizeof(smsBuf), "[REMOTE] %s", val);
+            xQueueSend(gsmQueue, smsBuf, 0);
+          } else if (strcmp(cmd, "GSM_ADD_SUB") == 0 && strlen(val) > 0) {
+            addSubscriberNVS(val);
+          } else if (strcmp(cmd, "GSM_CLEAR_SUBS") == 0) {
+            clearSubscribersNVS();
           }
+        } else if (err) {
+          Serial.printf("[LoRa RX ERROR] Deserialization failed: %s\n", err.c_str());
         }
-      } catch (...) {
-        Serial.println(F("[LoRa RX EXCEPTION] Packet read failure ignored."));
       }
       xSemaphoreGive(xSpiMutex);
     }
+
     vTaskDelay(pdMS_TO_TICKS(40));
   }
 }
@@ -442,10 +474,10 @@ void vTaskLoRaEngine(void *pvParameters) {
 void vTaskGSM(void *pvParameters) {
   Serial.println(F("[TASK] GSM Task Started."));
   resetInactivityTimer();
-  
+
   gsmSerial.begin(9600, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
   vTaskDelay(pdMS_TO_TICKS(1000));
-  
+
   gsmSerial.println("AT");
   vTaskDelay(pdMS_TO_TICKS(300));
   gsmSerial.println("AT+CMGF=1");
@@ -453,41 +485,37 @@ void vTaskGSM(void *pvParameters) {
   Serial.println(F("[GSM] Serial Interface Ready (9600 Baud, Text Mode)."));
 
   char alertMessage[160];
+
   for (;;) {
     if (xQueueReceive(gsmQueue, alertMessage, pdMS_TO_TICKS(100)) == pdTRUE) {
       Serial.printf("[GSM] SMS Dispatch requested: \"%s\"\n", alertMessage);
-      
+
       for (uint8_t i = 0; i < subscriberCount; i++) {
         Serial.printf("[GSM TX] Sending to sub [%d/%d]: %s\n", i + 1, subscriberCount, subscribers[i]);
-        
-        try {
-          gsmSerial.println("AT+CMGF=1");
-          vTaskDelay(pdMS_TO_TICKS(200));
-          gsmSerial.printf("AT+CMGS=\"%s\"\r\n", subscribers[i]);
-          vTaskDelay(pdMS_TO_TICKS(300));
-          gsmSerial.print(alertMessage);
-          gsmSerial.write(26); // CTRL+Z
-          
-          TickType_t startWait = xTaskGetTickCount();
-          bool sendOk = false;
-          while ((xTaskGetTickCount() - startWait) < pdMS_TO_TICKS(5000)) {
-            if (gsmSerial.available()) {
-              String resp = gsmSerial.readString();
-              if (resp.indexOf("OK") != -1 || resp.indexOf("+CMGS:") != -1) {
-                sendOk = true;
-                break;
-              }
-            }
-            vTaskDelay(pdMS_TO_TICKS(100));
-          }
 
-          if (sendOk) {
-            Serial.println(F("[GSM TX SUCCESS] Message confirmed by network."));
-          } else {
-            Serial.println(F("[GSM TX TIMEOUT] No confirmation received within interval."));
+        gsmSerial.println("AT+CMGF=1");
+        vTaskDelay(pdMS_TO_TICKS(200));
+        gsmSerial.printf("AT+CMGS=\"%s\"\r\n", subscribers[i]);
+        vTaskDelay(pdMS_TO_TICKS(300));
+        gsmSerial.print(alertMessage);
+        gsmSerial.write(26); // CTRL+Z
+
+        TickType_t startWait = xTaskGetTickCount();
+        bool sendOk = false;
+        while ((xTaskGetTickCount() - startWait) < pdMS_TO_TICKS(5000)) {
+          if (gsmSerial.available()) {
+            String resp = gsmSerial.readString();
+            if (resp.indexOf("OK") != -1 || resp.indexOf("+CMGS:") != -1) {
+              sendOk = true;
+              break;
+            }
           }
-        } catch (...) {
-          Serial.println(F("[GSM ERROR] Execution failed during message transfer."));
+          vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (sendOk) {
+          Serial.println(F("[GSM TX SUCCESS] Message confirmed by network."));
+        } else {
+          Serial.println(F("[GSM TX TIMEOUT] No confirmation received within interval."));
         }
       }
     }
@@ -531,43 +559,33 @@ void vTaskSystemEngine(void *pvParameters) {
     TickType_t xNow = xTaskGetTickCount();
     if ((xNow - xLastDhtReadTime) >= xDhtInterval) {
       xLastDhtReadTime = xNow;
-      
-      float rawTemp = NAN;
-      float rawHum  = NAN;
-      
-      try {
-        rawTemp = dht.readTemperature();
-        rawHum  = dht.readHumidity();
-      } catch (...) {
-        Serial.println(F("[DHT EXCEPTION] Bus access failure during sensor conversion."));
-      }
-      
+
+      float rawTemp = dht.readTemperature();
+      float rawHum  = dht.readHumidity();
+
       if (!isnan(rawTemp) && rawTemp >= -40.0f && rawTemp <= 80.0f) {
         filteredTemp = (filteredTemp < 0.0f) ? rawTemp : (EMA_ALPHA * rawTemp + (1.0f - EMA_ALPHA) * filteredTemp);
       } else {
         Serial.println(F("[SENSOR WARNING] DHT Temperature read invalid!"));
+        filteredTemp = -1.0f; // force dht_err until a good reading arrives again
       }
-
       if (!isnan(rawHum) && rawHum >= 0.0f && rawHum <= 100.0f) {
         filteredHum = (filteredHum < 0.0f) ? rawHum : (EMA_ALPHA * rawHum + (1.0f - EMA_ALPHA) * filteredHum);
       } else {
         Serial.println(F("[SENSOR WARNING] DHT Humidity read invalid!"));
+        filteredHum = -1.0f;
       }
     }
 
-    int rawVoc = -1;
-    try {
-      rawVoc = analogRead(MQ2_PIN);
-    } catch (...) {
-      Serial.println(F("[MQ2 EXCEPTION] Analog read failure!"));
-    }
-
+    int rawVoc = analogRead(MQ2_PIN);
     if (rawVoc >= 0 && rawVoc <= 4095) {
       filteredVoc = (filteredVoc < 0.0f) ? (float)rawVoc : (EMA_ALPHA * (float)rawVoc + (1.0f - EMA_ALPHA) * filteredVoc);
     }
 
+    bool dhtErr = (filteredTemp < 0.0f || filteredHum < 0.0f);
+
     // Accumulate metrics if gas sensor OR DHT sensors return valid data
-    if (filteredVoc >= 0.0f || (filteredTemp >= 0.0f && filteredHum >= 0.0f)) {
+    if (filteredVoc >= 0.0f || (!dhtErr)) {
       tempSum += (filteredTemp >= 0.0f) ? filteredTemp : 0.0f;
       humSum  += (filteredHum >= 0.0f)  ? filteredHum  : 0.0f;
       vocSum  += (filteredVoc >= 0.0f)  ? filteredVoc  : 0.0f;
@@ -577,25 +595,23 @@ void vTaskSystemEngine(void *pvParameters) {
     // Outbound LoRa Transmission Dispatch
     if ((xNow - xLastTxWindow) >= pdMS_TO_TICKS(TX_FAST_INTERVAL_MS)) {
       xLastTxWindow = xNow;
-
       if (samplesInWindow > 0) {
         EventBits_t currentBits = xEventGroupGetBits(xSystemEvents);
         bool isOverride = (currentBits & MODE_OVERRIDE_BIT) != 0;
         bool isBreached = (currentBits & THRESHOLD_BREACH_BIT) != 0;
 
         JsonDocument doc;
-        doc["temp"]     = (filteredTemp >= 0.0f) ? (float)(tempSum / samplesInWindow) : -999.0f;
-        doc["hum"]      = (filteredHum  >= 0.0f) ? (float)(humSum / samplesInWindow)  : -999.0f;
-        doc["voc"]      = (filteredVoc  >= 0.0f) ? (int)(vocSum / samplesInWindow)    : -1;
+        doc["temp"]     = (!dhtErr) ? (float)(tempSum / samplesInWindow) : SENTINEL_INVALID_F;
+        doc["hum"]      = (!dhtErr) ? (float)(humSum / samplesInWindow)  : SENTINEL_INVALID_F;
+        doc["voc"]      = (filteredVoc >= 0.0f) ? (int)(vocSum / samplesInWindow) : SENTINEL_INVALID_I;
         doc["samples"]  = samplesInWindow;
         doc["mode"]     = isOverride ? "OVERRIDE" : (isBreached ? "GUARDIAN" : "MONITOR");
         doc["breach"]   = isBreached;
-        doc["dht_err"]  = (filteredTemp < 0.0f || filteredHum < 0.0f);
+        doc["dht_err"]  = dhtErr;
         doc["gsm_subs"] = subscriberCount;
 
         char jsonBuffer[160];
         serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
-
         Serial.printf("[TELEMETRY] Queuing LoRa TX (%d samples): %s\n", samplesInWindow, jsonBuffer);
 
         if (xQueueSend(loraTxQueue, jsonBuffer, pdMS_TO_TICKS(50)) != pdTRUE) {
@@ -611,26 +627,21 @@ void vTaskSystemEngine(void *pvParameters) {
     bool breachDetected = false;
     float modelScore = 0.0f;
 
-    // Run inference only if TinyML engine is fully functional AND DHT measurements exist
-    if (isTinyMlReady && filteredTemp >= 0.0f && filteredHum >= 0.0f && filteredVoc >= 0.0f) {
-      try {
-        input->data.f[0] = filteredTemp / 100.0f;
-        input->data.f[1] = filteredHum / 100.0f;
-        input->data.f[2] = filteredVoc / 4095.0f;
+    if (isTinyMlReady && !dhtErr && filteredVoc >= 0.0f) {
+      input->data.f[0] = filteredTemp / 100.0f;
+      input->data.f[1] = filteredHum / 100.0f;
+      input->data.f[2] = filteredVoc / 4095.0f;
 
-        if (interpreter->Invoke() == kTfLiteOk) {
-          modelScore = output->data.f[1];
-          if (modelScore > 0.75f) breachDetected = true;
-        } else {
-          Serial.println(F("[TinyML ERROR] Model invocation failed during execution!"));
-        }
-      } catch (...) {
-        Serial.println(F("[TinyML CRITICAL] Standard exception encountered during inference!"));
+      if (interpreter->Invoke() == kTfLiteOk) {
+        modelScore = output->data.f[1];
+        if (modelScore > 0.75f) breachDetected = true;
+      } else {
+        Serial.println(F("[TinyML ERROR] Model invocation failed during execution!"));
       }
     } else {
-      // Fallback thresholding algorithm if DHT22 or TinyML fails
-      if ((filteredVoc > VOC_THRESHOLD && filteredVoc >= 0.0f) || 
-          (filteredTemp > TEMP_THRESHOLD && filteredTemp >= 0.0f) || 
+      // Fallback thresholding algorithm if DHT22 or TinyML is unavailable
+      if ((filteredVoc > VOC_THRESHOLD && filteredVoc >= 0.0f) ||
+          (filteredTemp > TEMP_THRESHOLD && filteredTemp >= 0.0f) ||
           (filteredHum > HUM_THRESHOLD && filteredHum >= 0.0f)) {
         breachDetected = true;
       }
@@ -660,9 +671,9 @@ void vTaskSystemEngine(void *pvParameters) {
       }
       if (!smsSentForBreach) {
         char msg[160];
-        snprintf(msg, sizeof(msg), "ALARM BREACH!\r\nT:%.1fC H:%.1f%% VOC:%d", 
-                 (filteredTemp >= 0.0f ? filteredTemp : -1.0f), 
-                 (filteredHum >= 0.0f ? filteredHum : -1.0f), 
+        snprintf(msg, sizeof(msg), "ALARM BREACH!\r\nT:%.1fC H:%.1f%% VOC:%d",
+                 (filteredTemp >= 0.0f ? filteredTemp : -1.0f),
+                 (filteredHum >= 0.0f ? filteredHum : -1.0f),
                  (int)filteredVoc);
         Serial.printf("[ALARM] Threshold breach detected! Score: %.2f. Queuing SMS Alert...\n", modelScore);
         if (xQueueSend(gsmQueue, msg, 0) == pdTRUE) smsSentForBreach = true;
@@ -672,6 +683,7 @@ void vTaskSystemEngine(void *pvParameters) {
       stopActuators();
       smsSentForBreach = false;
     }
+
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 }
@@ -684,9 +696,9 @@ void setup() {
   Serial.println(F("=========================================="));
 
   rtc_gpio_deinit((gpio_num_t)POWER_BUTTON);
-  #if defined(LORA_DIO0_PIN) && (LORA_DIO0_PIN >= 0)
+#if defined(LORA_DIO0_PIN) && (LORA_DIO0_PIN >= 0)
   rtc_gpio_deinit((gpio_num_t)LORA_DIO0_PIN);
-  #endif
+#endif
 
   Serial.println(F("[SETUP] Initializing NVS Flash..."));
   esp_err_t err = nvs_flash_init();
@@ -696,6 +708,7 @@ void setup() {
   }
   ESP_ERROR_CHECK(err);
 
+  checkWakeupReason();
   loadSubscribers();
 
   Serial.println(F("[SETUP] Configuring GPIOs & PWM Channels..."));
@@ -720,13 +733,14 @@ void setup() {
   xSystemEvents = xEventGroupCreate();
   xPowerSleepSemaphore = xSemaphoreCreateBinary();
   xActivityMutex = xSemaphoreCreateMutex();
-  xSpiMutex = xSemaphoreCreateMutex();   
+  xSpiMutex = xSemaphoreCreateMutex();
 
   gsmQueue       = xQueueCreate(3, sizeof(char[160]));
   systemCmdQueue = xQueueCreate(10, sizeof(SystemCommandType));
   loraTxQueue    = xQueueCreate(5, sizeof(char[160]));
 
   setSystemModeAtomic(MODE_INSPECT_BIT);
+
   dht.begin();
   initTinyML();
 
