@@ -39,7 +39,6 @@
     .btn-warn:hover { background: #ca8a04; }
     .btn-dark { background: #475569; }
     .btn-dark:hover { background: #334155; }
-    .btn-sm { padding: 4px 8px; font-size: 0.75rem; }
 
     /* Dashboard Grid Layout */
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 15px; margin-bottom: 20px; }
@@ -63,7 +62,7 @@
     @media (max-width: 1000px) { .main-content { grid-template-columns: 1fr; } }
 
     /* Controls Panel */
-    .controls-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 15px; }
+    .controls-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 15px; }
     .input-group { display: flex; gap: 5px; margin-top: 10px; }
     .input-group input {
       flex: 1; background: var(--bg-dark); border: 1px solid var(--border);
@@ -75,7 +74,6 @@
     .cmd-table th, .cmd-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
     .cmd-table th { color: var(--text-muted); text-transform: uppercase; font-size: 0.75rem; background: rgba(0,0,0,0.2); }
     .cmd-table code { font-family: monospace; color: var(--accent-blue); background: rgba(56, 189, 248, 0.1); padding: 2px 5px; border-radius: 4px; }
-    .cmd-table .json-preview { font-family: monospace; color: var(--accent-green); font-size: 0.78rem; }
 
     .table-container { height: 350px; overflow-y: auto; }
 
@@ -116,8 +114,9 @@
       <div class="card-value" id="card-hum"><span id="val-hum">--</span> %</div>
     </div>
     <div class="card">
-      <div class="card-title">VOC Level</div>
-      <div class="card-value" id="card-voc"><span id="val-voc">--</span></div>
+      <div class="card-title">VOC Air Concentration</div>
+      <div class="card-value" id="card-voc"><span id="val-voc-pct">--</span> %</div>
+      <div style="font-size: 0.8rem; color: var(--text-muted); margin-top: 4px;">Index: <span id="val-voc-raw">--</span> / 1200</div>
     </div>
     <div class="card">
       <div class="card-title">System Status</div>
@@ -161,7 +160,7 @@
               <th>Time</th>
               <th>Temp</th>
               <th>Hum</th>
-              <th>VOC</th>
+              <th>VOC Conc. (%)</th>
               <th>Heat Index</th>
               <th>Inference / Analysis</th>
             </tr>
@@ -179,11 +178,11 @@
     <div class="card">
       <div class="card-title">System Command Center</div>
 
+      <!-- Updated Buttons Layout (Removed Toggle Mode Button) -->
       <div class="controls-grid" style="margin-top: 10px;">
         <button class="btn btn-dark" onclick="sendCmd('G')" title='Sends {"cmd":"SET_MODE","val":"GUARDIAN"}'>Guardian Mode (G)</button>
         <button class="btn btn-dark" onclick="sendCmd('M')" title='Sends {"cmd":"SET_MODE","val":"MONITOR"}'>Monitor Mode (M)</button>
-        <button class="btn btn-warn" onclick="sendCmd('T')" title='Sends {"cmd":"SET_MODE","val":"TOGGLE"}'>Toggle Mode (T)</button>
-        <button class="btn btn-danger" onclick="sendCmd('P')" title='Sends {"cmd":"POWER","val":"OFF"}'>Deep Sleep (P)</button>
+        <button class="btn btn-danger" onclick="sendCmd('P')" title='Sends {"cmd":"POWER","val":"OFF"}'>Toggle Power (P)</button>
       </div>
 
       <div class="card-title" style="margin-top: 15px;">ESP32 NVS Subscriber Manager</div>
@@ -208,13 +207,17 @@
     const telemetryHistory = [];
     const MAX_STORED_RECORDS = 50;
 
-    // Must match the node firmware's telemetry contract (see grain_node.ino):
-    // temp/hum arrive as -999 and voc as -1 whenever the node's DHT/ADC read
-    // is currently invalid. Never render these sentinels as real numbers.
     const SENTINEL_INVALID_F = -999;
     const SENTINEL_INVALID_I = -1;
     const isTempHumValid = (v) => v !== null && v > (SENTINEL_INVALID_F + 1);
     const isVocValid = (v) => v !== null && v > SENTINEL_INVALID_I;
+
+    // Scale VOC raw index (0 - 500) into Percentage (0 - 100%)
+    function convertVocToPercentage(rawVoc) {
+      if (!isVocValid(rawVoc)) return null;
+      let pct = (rawVoc / 1200) * 100;
+      return Math.min(Math.max(pct, 0), 100).toFixed(1);
+    }
 
     // --- CHART INITIALIZATION ---
     const ctx = document.getElementById('telemetryChart').getContext('2d');
@@ -225,7 +228,7 @@
         datasets: [
           { label: 'Temp (°C)', borderColor: '#ef4444', data: [], tension: 0.3, fill: false, spanGaps: true },
           { label: 'Humidity (%)', borderColor: '#38bdf8', data: [], tension: 0.3, fill: false, spanGaps: true },
-          { label: 'VOC Index', borderColor: '#eab308', data: [], tension: 0.3, fill: false, spanGaps: true }
+          { label: 'VOC Conc. (%)', borderColor: '#eab308', data: [], tension: 0.3, fill: false, spanGaps: true }
         ]
       },
       options: {
@@ -239,7 +242,7 @@
       }
     });
 
-    // --- VIEW SWITCHING (CHART <-> TABLE) ---
+    // --- VIEW SWITCHING ---
     function switchView(view) {
       const chartContainer = document.getElementById('container-chart');
       const tableContainer = document.getElementById('container-table');
@@ -275,7 +278,7 @@
       return hiC.toFixed(1);
     }
 
-    function generateInference(temp, hum, voc, breach, dhtErr) {
+    function generateInference(temp, hum, vocRaw, breach, dhtErr) {
       const inferences = [];
       let statusClass = 'badge-safe';
 
@@ -288,11 +291,11 @@
         statusClass = 'badge-warn';
       }
 
-      if (isVocValid(voc)) {
-        if (voc > 250) {
+      if (isVocValid(vocRaw)) {
+        if (vocRaw > 250) {
           inferences.push('Poor air quality (High VOCs)');
           statusClass = 'badge-breach';
-        } else if (voc > 150) {
+        } else if (vocRaw > 150) {
           inferences.push('Moderate VOC pollution');
           if (statusClass !== 'badge-breach') statusClass = 'badge-warn';
         }
@@ -337,7 +340,7 @@
             <td><code>${entry.timestamp}</code></td>
             <td>${entry.temp !== null ? entry.temp + ' °C' : 'ERR'}</td>
             <td>${entry.hum !== null ? entry.hum + ' %' : 'ERR'}</td>
-            <td>${entry.voc !== null ? entry.voc : 'N/A'}</td>
+            <td>${entry.vocPct !== null ? entry.vocPct + ' % (' + entry.vocRaw + ')' : 'N/A'}</td>
             <td>${entry.heatIndex !== null ? entry.heatIndex + ' °C' : '--'}</td>
             <td><span class="badge ${entry.inference.badgeClass}">${entry.inference.text}</span></td>
           </tr>
@@ -405,17 +408,18 @@
         const rawHum = data.hum !== undefined ? Number(data.hum) : null;
         const rawVoc = data.voc !== undefined ? Number(data.voc) : null;
 
-        // dht_err is the authoritative flag from the node; fall back to the
-        // sentinel value itself for older node builds that don't send it.
         const dhtErr = data.dht_err !== undefined ? !!data.dht_err : !isTempHumValid(rawTemp);
 
         const tempVal = (!dhtErr && isTempHumValid(rawTemp)) ? rawTemp : null;
         const humVal  = (!dhtErr && isTempHumValid(rawHum))  ? rawHum  : null;
-        const vocVal  = isVocValid(rawVoc) ? rawVoc : null;
+        const vocRawVal = isVocValid(rawVoc) ? rawVoc : null;
+        const vocPctVal = convertVocToPercentage(vocRawVal);
 
         document.getElementById('val-temp').textContent = tempVal !== null ? tempVal.toFixed(1) : 'ERR';
         document.getElementById('val-hum').textContent  = humVal  !== null ? humVal.toFixed(1)  : 'ERR';
-        document.getElementById('val-voc').textContent  = vocVal  !== null ? vocVal             : 'N/A';
+        document.getElementById('val-voc-pct').textContent = vocPctVal !== null ? vocPctVal : '--';
+        document.getElementById('val-voc-raw').textContent = vocRawVal !== null ? vocRawVal : '--';
+
         document.getElementById('card-temp').classList.toggle('err', tempVal === null);
         document.getElementById('card-hum').classList.toggle('err', humVal === null);
 
@@ -440,18 +444,19 @@
 
         const timestamp = new Date().toLocaleTimeString();
 
-        // Push to Chart (null values create a gap instead of a fake dip to 0/-999)
-        pushChartData(timestamp, tempVal, humVal, vocVal);
+        // Push VOC percentage value to chart
+        pushChartData(timestamp, tempVal, humVal, vocPctVal);
 
         // Store Record with Inference
         const heatIndex = calculateHeatIndex(tempVal, humVal);
-        const inference = generateInference(tempVal, humVal, vocVal, data.breach, dhtErr);
+        const inference = generateInference(tempVal, humVal, vocRawVal, data.breach, dhtErr);
 
         telemetryHistory.unshift({
           timestamp,
           temp: tempVal !== null ? tempVal.toFixed(1) : null,
           hum: humVal !== null ? humVal.toFixed(1) : null,
-          voc: vocVal,
+          vocRaw: vocRawVal,
+          vocPct: vocPctVal,
           heatIndex,
           inference
         });
@@ -460,7 +465,6 @@
           telemetryHistory.pop();
         }
 
-        // If the table view is currently open, dynamically refresh it
         if (document.getElementById('container-table').style.display !== 'none') {
           renderStorageTable();
         }
@@ -470,11 +474,11 @@
       }
     }
 
-    function pushChartData(label, temp, hum, voc) {
+    function pushChartData(label, temp, hum, vocPct) {
       telemetryChart.data.labels.push(label);
       telemetryChart.data.datasets[0].data.push(temp ?? null);
       telemetryChart.data.datasets[1].data.push(hum ?? null);
-      telemetryChart.data.datasets[2].data.push(voc ?? null);
+      telemetryChart.data.datasets[2].data.push(vocPct ?? null);
 
       if (telemetryChart.data.labels.length > 25) {
         telemetryChart.data.labels.shift();
