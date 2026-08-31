@@ -283,6 +283,7 @@ void triggerDeepSleep() {
   rtc_gpio_pulldown_dis((gpio_num_t)POWER_BUTTON);
   esp_sleep_enable_ext1_wakeup(BUTTON_WAKEUP_MASK, ESP_EXT1_WAKEUP_ALL_LOW);
 
+  esp_sleep_enable_timer_wakeup((uint64_t)AWAKE_INTERVAL_SEC * 1000000ULL);
   Serial.println(F("[POWER] Entering Deep Sleep NOW."));
   Serial.flush();
   esp_deep_sleep_start();
