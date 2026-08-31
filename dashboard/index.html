@@ -47,6 +47,7 @@
     .card-header-flex { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
     .card-title { font-size: 0.85rem; color: var(--text-muted); text-transform: uppercase; }
     .card-value { font-size: 1.8rem; font-weight: 700; color: var(--accent-blue); }
+    .card-value.err { color: var(--accent-red); font-size: 1.3rem; }
 
     /* Badges */
     .badge {
@@ -108,20 +109,21 @@
   <div class="grid">
     <div class="card">
       <div class="card-title">Temperature</div>
-      <div class="card-value"><span id="val-temp">--</span> °C</div>
+      <div class="card-value" id="card-temp"><span id="val-temp">--</span> °C</div>
     </div>
     <div class="card">
       <div class="card-title">Humidity</div>
-      <div class="card-value"><span id="val-hum">--</span> %</div>
+      <div class="card-value" id="card-hum"><span id="val-hum">--</span> %</div>
     </div>
     <div class="card">
       <div class="card-title">VOC Level</div>
-      <div class="card-value"><span id="val-voc">--</span></div>
+      <div class="card-value" id="card-voc"><span id="val-voc">--</span></div>
     </div>
     <div class="card">
       <div class="card-title">System Status</div>
       <div style="margin-top: 5px;">
         <span id="badge-breach" class="badge badge-safe">NOMINAL</span>
+        <span id="badge-dht" class="badge badge-warn" style="display:none; margin-left: 6px;">DHT FAULT</span>
       </div>
       <div style="margin-top: 8px; font-size: 0.85rem; color: var(--text-muted);">
         Mode: <strong id="val-mode" style="color:white;">--</strong> | Subs: <strong id="val-subs" style="color:white;">0</strong>
@@ -145,7 +147,7 @@
           <button id="btn-view-table" class="toggle-btn" onclick="switchView('table')">Storage & Inferences</button>
         </div>
       </div>
-      
+
       <!-- Chart Display View -->
       <div id="container-chart" style="position: relative; height: 350px;">
         <canvas id="telemetryChart"></canvas>
@@ -176,7 +178,7 @@
     <!-- Mode Controls & Dynamic Dispatch -->
     <div class="card">
       <div class="card-title">System Command Center</div>
-      
+
       <div class="controls-grid" style="margin-top: 10px;">
         <button class="btn btn-dark" onclick="sendCmd('G')" title='Sends {"cmd":"SET_MODE","val":"GUARDIAN"}'>Guardian Mode (G)</button>
         <button class="btn btn-dark" onclick="sendCmd('M')" title='Sends {"cmd":"SET_MODE","val":"MONITOR"}'>Monitor Mode (M)</button>
@@ -206,6 +208,14 @@
     const telemetryHistory = [];
     const MAX_STORED_RECORDS = 50;
 
+    // Must match the node firmware's telemetry contract (see grain_node.ino):
+    // temp/hum arrive as -999 and voc as -1 whenever the node's DHT/ADC read
+    // is currently invalid. Never render these sentinels as real numbers.
+    const SENTINEL_INVALID_F = -999;
+    const SENTINEL_INVALID_I = -1;
+    const isTempHumValid = (v) => v !== null && v > (SENTINEL_INVALID_F + 1);
+    const isVocValid = (v) => v !== null && v > SENTINEL_INVALID_I;
+
     // --- CHART INITIALIZATION ---
     const ctx = document.getElementById('telemetryChart').getContext('2d');
     const telemetryChart = new Chart(ctx, {
@@ -213,9 +223,9 @@
       data: {
         labels: [],
         datasets: [
-          { label: 'Temp (°C)', borderColor: '#ef4444', data: [], tension: 0.3, fill: false },
-          { label: 'Humidity (%)', borderColor: '#38bdf8', data: [], tension: 0.3, fill: false },
-          { label: 'VOC Index', borderColor: '#eab308', data: [], tension: 0.3, fill: false }
+          { label: 'Temp (°C)', borderColor: '#ef4444', data: [], tension: 0.3, fill: false, spanGaps: true },
+          { label: 'Humidity (%)', borderColor: '#38bdf8', data: [], tension: 0.3, fill: false, spanGaps: true },
+          { label: 'VOC Index', borderColor: '#eab308', data: [], tension: 0.3, fill: false, spanGaps: true }
         ]
       },
       options: {
@@ -257,15 +267,15 @@
     function calculateHeatIndex(tempC, humidity) {
       if (tempC === null || humidity === null) return null;
       const tempF = (tempC * 9/5) + 32;
-      let hi = -42.379 + 2.04901523*tempF + 10.14333127*humidity - .22475541*tempF*humidity 
-               - .00683783*tempF*tempF - .05481717*humidity*humidity 
-               + .00122874*tempF*tempF*humidity + .00085282*tempF*humidity*humidity 
+      let hi = -42.379 + 2.04901523*tempF + 10.14333127*humidity - .22475541*tempF*humidity
+               - .00683783*tempF*tempF - .05481717*humidity*humidity
+               + .00122874*tempF*tempF*humidity + .00085282*tempF*humidity*humidity
                - .00000199*tempF*tempF*humidity*humidity;
       const hiC = (hi - 32) * 5/9;
       return hiC.toFixed(1);
     }
 
-    function generateInference(temp, hum, voc, breach) {
+    function generateInference(temp, hum, voc, breach, dhtErr) {
       const inferences = [];
       let statusClass = 'badge-safe';
 
@@ -273,17 +283,22 @@
         return { text: 'CRITICAL: Gas breach hazard detected!', badgeClass: 'badge-breach' };
       }
 
-      if (voc !== null && voc !== undefined) {
+      if (dhtErr) {
+        inferences.push('DHT sensor fault - temp/humidity unavailable');
+        statusClass = 'badge-warn';
+      }
+
+      if (isVocValid(voc)) {
         if (voc > 250) {
           inferences.push('Poor air quality (High VOCs)');
           statusClass = 'badge-breach';
         } else if (voc > 150) {
           inferences.push('Moderate VOC pollution');
-          statusClass = 'badge-warn';
+          if (statusClass !== 'badge-breach') statusClass = 'badge-warn';
         }
       }
 
-      if (temp !== null && temp !== undefined) {
+      if (!dhtErr && isTempHumValid(temp)) {
         if (temp > 35) {
           inferences.push('Extreme Heat Stress');
           statusClass = 'badge-breach';
@@ -293,7 +308,7 @@
         }
       }
 
-      if (hum !== null && hum !== undefined) {
+      if (!dhtErr && isTempHumValid(hum)) {
         if (hum > 75) {
           inferences.push('High Humidity / Condensation Risk');
         } else if (hum < 20) {
@@ -320,9 +335,9 @@
         return `
           <tr>
             <td><code>${entry.timestamp}</code></td>
-            <td>${entry.temp !== null ? entry.temp + ' °C' : '--'}</td>
-            <td>${entry.hum !== null ? entry.hum + ' %' : '--'}</td>
-            <td>${entry.voc !== null ? entry.voc : '--'}</td>
+            <td>${entry.temp !== null ? entry.temp + ' °C' : 'ERR'}</td>
+            <td>${entry.hum !== null ? entry.hum + ' %' : 'ERR'}</td>
+            <td>${entry.voc !== null ? entry.voc : 'N/A'}</td>
             <td>${entry.heatIndex !== null ? entry.heatIndex + ' °C' : '--'}</td>
             <td><span class="badge ${entry.inference.badgeClass}">${entry.inference.text}</span></td>
           </tr>
@@ -363,7 +378,7 @@
             const { value, done } = await reader.read();
             if (done) break;
             rxBuffer += decoder.decode(value);
-            
+
             let lines = rxBuffer.split('\n');
             rxBuffer = lines.pop();
 
@@ -386,16 +401,27 @@
       try {
         const data = JSON.parse(rawString);
 
-        const tempVal = data.temp !== undefined ? Number(data.temp) : null;
-        const humVal = data.hum !== undefined ? Number(data.hum) : null;
-        const vocVal = data.voc !== undefined ? Number(data.voc) : null;
+        const rawTemp = data.temp !== undefined ? Number(data.temp) : null;
+        const rawHum = data.hum !== undefined ? Number(data.hum) : null;
+        const rawVoc = data.voc !== undefined ? Number(data.voc) : null;
 
-        if (tempVal !== null) document.getElementById('val-temp').textContent = tempVal.toFixed(1);
-        if (humVal !== null) document.getElementById('val-hum').textContent = humVal.toFixed(1);
-        if (vocVal !== null) document.getElementById('val-voc').textContent = vocVal;
+        // dht_err is the authoritative flag from the node; fall back to the
+        // sentinel value itself for older node builds that don't send it.
+        const dhtErr = data.dht_err !== undefined ? !!data.dht_err : !isTempHumValid(rawTemp);
+
+        const tempVal = (!dhtErr && isTempHumValid(rawTemp)) ? rawTemp : null;
+        const humVal  = (!dhtErr && isTempHumValid(rawHum))  ? rawHum  : null;
+        const vocVal  = isVocValid(rawVoc) ? rawVoc : null;
+
+        document.getElementById('val-temp').textContent = tempVal !== null ? tempVal.toFixed(1) : 'ERR';
+        document.getElementById('val-hum').textContent  = humVal  !== null ? humVal.toFixed(1)  : 'ERR';
+        document.getElementById('val-voc').textContent  = vocVal  !== null ? vocVal             : 'N/A';
+        document.getElementById('card-temp').classList.toggle('err', tempVal === null);
+        document.getElementById('card-hum').classList.toggle('err', humVal === null);
+
         if (data.mode !== undefined) document.getElementById('val-mode').textContent = data.mode;
         if (data.gsm_subs !== undefined) document.getElementById('val-subs').textContent = data.gsm_subs;
-        
+
         if (data.rssi !== undefined) document.getElementById('val-rssi').textContent = data.rssi;
         if (data.snr !== undefined) document.getElementById('val-snr').textContent = data.snr;
         if (data.packets !== undefined) document.getElementById('val-pkts').textContent = data.packets;
@@ -409,14 +435,17 @@
           breachBadge.className = 'badge badge-safe';
         }
 
+        const dhtBadge = document.getElementById('badge-dht');
+        dhtBadge.style.display = dhtErr ? 'inline-block' : 'none';
+
         const timestamp = new Date().toLocaleTimeString();
-        
-        // Push to Chart
+
+        // Push to Chart (null values create a gap instead of a fake dip to 0/-999)
         pushChartData(timestamp, tempVal, humVal, vocVal);
 
         // Store Record with Inference
         const heatIndex = calculateHeatIndex(tempVal, humVal);
-        const inference = generateInference(tempVal, humVal, vocVal, data.breach);
+        const inference = generateInference(tempVal, humVal, vocVal, data.breach, dhtErr);
 
         telemetryHistory.unshift({
           timestamp,
@@ -468,7 +497,7 @@
       const field = document.getElementById(inputId);
       const val = field.value.trim();
       if (!val) return;
-      
+
       const payload = prefix + val;
       await sendCmd(payload);
     }
