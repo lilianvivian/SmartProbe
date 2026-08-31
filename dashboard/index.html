@@ -189,6 +189,7 @@
       <div class="input-group">
         <input type="text" id="gsm-phone" placeholder="+254712345678" value="+254712345678">
         <button class="btn" onclick="sendParamCmd('ADD:', 'gsm-phone')">Add Sub</button>
+        <button class="btn btn-danger" onclick="sendParamCmd('RM:', 'gsm-phone')">Remove Sub</button>
       </div>
       <div class="input-group">
         <input type="text" id="gsm-sms" placeholder="Gas Breach Alert" value="Gas Breach Alert">
@@ -398,81 +399,74 @@
     }
 
     // --- DATA PROCESSOR & UI UPDATE ---
-    function parseJSONPacket(rawString) {
-      if (!rawString.startsWith('{') || !rawString.endsWith('}')) return;
+function parseJSONPacket(rawString) {
+  if (!rawString.startsWith('{') || !rawString.endsWith('}')) return;
 
-      try {
-        const data = JSON.parse(rawString);
+  try {
+    const data = JSON.parse(rawString);
+    const isFullTelemetry = data.temp !== undefined;
 
-        const rawTemp = data.temp !== undefined ? Number(data.temp) : null;
-        const rawHum = data.hum !== undefined ? Number(data.hum) : null;
-        const rawVoc = data.voc !== undefined ? Number(data.voc) : null;
+    if (isFullTelemetry) {
+      const rawTemp = Number(data.temp);
+      const rawHum  = data.hum !== undefined ? Number(data.hum) : null;
+      const rawVoc  = data.voc !== undefined ? Number(data.voc) : null;
+      const dhtErr = data.dht_err !== undefined ? !!data.dht_err : !isTempHumValid(rawTemp);
 
-        const dhtErr = data.dht_err !== undefined ? !!data.dht_err : !isTempHumValid(rawTemp);
+      const tempVal = (!dhtErr && isTempHumValid(rawTemp)) ? rawTemp : null;
+      const humVal  = (!dhtErr && isTempHumValid(rawHum))  ? rawHum  : null;
+      const vocRawVal = isVocValid(rawVoc) ? rawVoc : null;
+      const vocPctVal = convertVocToPercentage(vocRawVal);
 
-        const tempVal = (!dhtErr && isTempHumValid(rawTemp)) ? rawTemp : null;
-        const humVal  = (!dhtErr && isTempHumValid(rawHum))  ? rawHum  : null;
-        const vocRawVal = isVocValid(rawVoc) ? rawVoc : null;
-        const vocPctVal = convertVocToPercentage(vocRawVal);
+      document.getElementById('val-temp').textContent = tempVal !== null ? tempVal.toFixed(1) : 'ERR';
+      document.getElementById('val-hum').textContent  = humVal  !== null ? humVal.toFixed(1)  : 'ERR';
+      document.getElementById('val-voc-pct').textContent = vocPctVal !== null ? vocPctVal : '--';
+      document.getElementById('val-voc-raw').textContent = vocRawVal !== null ? vocRawVal : '--';
 
-        document.getElementById('val-temp').textContent = tempVal !== null ? tempVal.toFixed(1) : 'ERR';
-        document.getElementById('val-hum').textContent  = humVal  !== null ? humVal.toFixed(1)  : 'ERR';
-        document.getElementById('val-voc-pct').textContent = vocPctVal !== null ? vocPctVal : '--';
-        document.getElementById('val-voc-raw').textContent = vocRawVal !== null ? vocRawVal : '--';
+      document.getElementById('card-temp').classList.toggle('err', tempVal === null);
+      document.getElementById('card-hum').classList.toggle('err', humVal === null);
 
-        document.getElementById('card-temp').classList.toggle('err', tempVal === null);
-        document.getElementById('card-hum').classList.toggle('err', humVal === null);
-
-        if (data.mode !== undefined) document.getElementById('val-mode').textContent = data.mode;
-        if (data.gsm_subs !== undefined) document.getElementById('val-subs').textContent = data.gsm_subs;
-
-        if (data.rssi !== undefined) document.getElementById('val-rssi').textContent = data.rssi;
-        if (data.snr !== undefined) document.getElementById('val-snr').textContent = data.snr;
-        if (data.packets !== undefined) document.getElementById('val-pkts').textContent = data.packets;
-
-        const breachBadge = document.getElementById('badge-breach');
-        if (data.breach) {
-          breachBadge.textContent = 'BREACH DETECTED';
-          breachBadge.className = 'badge badge-breach';
-        } else {
-          breachBadge.textContent = 'NOMINAL';
-          breachBadge.className = 'badge badge-safe';
-        }
-
-        const dhtBadge = document.getElementById('badge-dht');
-        dhtBadge.style.display = dhtErr ? 'inline-block' : 'none';
-
-        const timestamp = new Date().toLocaleTimeString();
-
-        // Push VOC percentage value to chart
-        pushChartData(timestamp, tempVal, humVal, vocPctVal);
-
-        // Store Record with Inference
-        const heatIndex = calculateHeatIndex(tempVal, humVal);
-        const inference = generateInference(tempVal, humVal, vocRawVal, data.breach, dhtErr);
-
-        telemetryHistory.unshift({
-          timestamp,
-          temp: tempVal !== null ? tempVal.toFixed(1) : null,
-          hum: humVal !== null ? humVal.toFixed(1) : null,
-          vocRaw: vocRawVal,
-          vocPct: vocPctVal,
-          heatIndex,
-          inference
-        });
-
-        if (telemetryHistory.length > MAX_STORED_RECORDS) {
-          telemetryHistory.pop();
-        }
-
-        if (document.getElementById('container-table').style.display !== 'none') {
-          renderStorageTable();
-        }
-
-      } catch (err) {
-        logConsole('JSON Parse Error: ' + rawString);
+      const breachBadge = document.getElementById('badge-breach');
+      if (data.breach) {
+        breachBadge.textContent = 'BREACH DETECTED';
+        breachBadge.className = 'badge badge-breach';
+      } else {
+        breachBadge.textContent = 'NOMINAL';
+        breachBadge.className = 'badge badge-safe';
       }
+
+      document.getElementById('badge-dht').style.display = dhtErr ? 'inline-block' : 'none';
+
+      const timestamp = new Date().toLocaleTimeString();
+      pushChartData(timestamp, tempVal, humVal, vocPctVal);
+
+      const heatIndex = calculateHeatIndex(tempVal, humVal);
+      const inference = generateInference(tempVal, humVal, vocRawVal, data.breach, dhtErr);
+
+      telemetryHistory.unshift({
+        timestamp,
+        temp: tempVal !== null ? tempVal.toFixed(1) : null,
+        hum: humVal !== null ? humVal.toFixed(1) : null,
+        vocRaw: vocRawVal,
+        vocPct: vocPctVal,
+        heatIndex,
+        inference
+      });
+      if (telemetryHistory.length > MAX_STORED_RECORDS) telemetryHistory.pop();
+      if (document.getElementById('container-table').style.display !== 'none') renderStorageTable();
     }
+
+    // These can arrive standalone (e.g. the ack packet after ADD/REMOVE/CLEAR)
+    // or alongside full telemetry — never gated on isFullTelemetry.
+    if (data.mode !== undefined) document.getElementById('val-mode').textContent = data.mode;
+    if (data.gsm_subs !== undefined) document.getElementById('val-subs').textContent = data.gsm_subs;
+    if (data.rssi !== undefined) document.getElementById('val-rssi').textContent = data.rssi;
+    if (data.snr !== undefined) document.getElementById('val-snr').textContent = data.snr;
+    if (data.packets !== undefined) document.getElementById('val-pkts').textContent = data.packets;
+
+  } catch (err) {
+    logConsole('JSON Parse Error: ' + rawString);
+  }
+}
 
     function pushChartData(label, temp, hum, vocPct) {
       telemetryChart.data.labels.push(label);

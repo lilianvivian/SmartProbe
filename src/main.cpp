@@ -1,6 +1,7 @@
 #include <SPI.h>
 #include <LoRa.h>
 #include <Wire.h>
+#include <LibPrintf.h>
 #include <LiquidCrystal_I2C.h>
 
 #define LORA_CS          10
@@ -11,6 +12,9 @@
 #define LORA_FREQ        868E6
 #define DEBOUNCE_MS      50
 #define DISPLAY_INTERVAL 400
+
+#define GSM_CMD_MAX_RETRIES     3
+#define GSM_CMD_ACK_TIMEOUT_MS  2000
 
 struct BaseStationState {
   float temp = 0.0;
@@ -35,6 +39,54 @@ BaseStationState baseState;
 bool buttonWasPressed = false;
 unsigned long pressStartTime = 0;
 unsigned long lastDisplayUpdate = 0;
+
+bool sendLoRaCommand(const char* payload);
+
+
+bool sendReliableGsmCmd(const char* payload) {
+  for (uint8_t attempt = 1; attempt <= GSM_CMD_MAX_RETRIES; attempt++) {
+    printf("[GSM CMD] Attempt %d/%d: %s\n", attempt, GSM_CMD_MAX_RETRIES, payload);
+    if (!sendLoRaCommand(payload)) continue;  // hardware TX failure, retry immediately
+
+    unsigned long waitStart = millis();
+    while (millis() - waitStart < GSM_CMD_ACK_TIMEOUT_MS) {
+      int packetSize = LoRa.parsePacket();
+      if (packetSize <= 0) continue;
+
+      char rxBuf[48];
+      int n = 0;
+      while (LoRa.available() && n < (int)sizeof(rxBuf) - 1) rxBuf[n++] = (char)LoRa.read();
+      rxBuf[n] = '\0';
+
+      char* subPtr = strstr(rxBuf, "\"gsm_subs\":");
+      if (subPtr != NULL) {
+        baseState.gsmSubs = atoi(subPtr + 11);
+        Serial.print(F("[GSM CMD] Ack received, gsm_subs="));
+        Serial.println(baseState.gsmSubs);
+        // Push the updated count to the dashboard right away, same shape
+        // handleLoRaRx() uses, so the UI doesn't wait for next telemetry tick.
+        Serial.print(F("{\"gsm_subs\":"));
+        Serial.print(baseState.gsmSubs);
+        Serial.println('}');
+        return true;
+      }
+
+      // Not our ack — likely a normal telemetry packet arriving mid-wait.
+      // Forward it as usual so we don't drop real sensor data while waiting.
+      baseState.packets++;
+      if (n > 1 && rxBuf[n - 1] == '}') {
+        Serial.write((const uint8_t *)rxBuf, n - 1);
+        Serial.print(F(",\"rssi\":"));    Serial.print(LoRa.packetRssi());
+        Serial.print(F(",\"snr\":"));     Serial.print(LoRa.packetSnr(), 1);
+        Serial.print(F(",\"packets\":")); Serial.print(baseState.packets);
+        Serial.println('}');
+      }
+    }
+    Serial.println(F("[GSM CMD] No ack within timeout, retrying..."));
+  }
+  Serial.println(F("[GSM CMD ERROR] All retries exhausted — command not confirmed."));
+  return false;
+}
 
 // Hardware Error Guarded TX Function
 bool sendLoRaCommand(const char* payload) {
@@ -102,14 +154,22 @@ void handleSerialCommands() {
   } else if (strcmp(buf, "P") == 0) {
     sendLoRaCommand("{\"cmd\":\"POWER\",\"val\":\"OFF\"}");
   } else if (strcmp(buf, "C") == 0) {
-    sendLoRaCommand("{\"cmd\":\"GSM_CLEAR_SUBS\",\"val\":\"\"}");
+    sendReliableGsmCmd("{\"cmd\":\"GSM_CLEAR_SUBS\",\"val\":\"\"}");
   } else if (strncmp(buf, "ADD:", 4) == 0) {
     char cmdBuf[48];
     int written = snprintf(cmdBuf, sizeof(cmdBuf), "{\"cmd\":\"GSM_ADD_SUB\",\"val\":\"%s\"}", buf + 4);
     if (written > 0 && written < (int)sizeof(cmdBuf)) {
-      sendLoRaCommand(cmdBuf);
+      sendReliableGsmCmd(cmdBuf);
     } else {
       Serial.println(F("[ERROR] ADD: Buffer overflow prevented"));
+    }
+  } else if (strncmp(buf, "RM:", 3) == 0) {
+    char cmdBuf[48];
+    int written = snprintf(cmdBuf, sizeof(cmdBuf), "{\"cmd\":\"GSM_REMOVE_SUB\",\"val\":\"%s\"}", buf + 3);
+    if (written > 0 && written < (int)sizeof(cmdBuf)) {
+      sendReliableGsmCmd(cmdBuf);
+    } else {
+      Serial.println(F("[ERROR] RM: Buffer overflow prevented"));
     }
   } else if (strncmp(buf, "SMS:", 4) == 0) {
     char cmdBuf[48];
