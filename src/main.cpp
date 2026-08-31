@@ -115,8 +115,8 @@ uint8_t subscriberCount = 0;
 // --- Helper Functions for GSM NVS Management ---
 void loadSubscribers() {
   Serial.println(F("[NVS] Loading subscribers..."));
-  if (!preferences.begin("gsm_subs", true)) {
-    Serial.println(F("[NVS ERROR] Failed to open Preferences namespace. Using defaults."));
+  if (!preferences.begin("gsm_subs", false)) {   // read-write: can create namespace
+    Serial.println(F("[NVS ERROR] Failed to open Preferences namespace. Using defaults (RAM only)."));
     strncpy(subscribers[0], TARGET_PHONE_NUM, PHONE_LEN - 1);
     subscribers[0][PHONE_LEN - 1] = '\0';
     subscriberCount = 1;
@@ -124,19 +124,32 @@ void loadSubscribers() {
   }
 
   subscriberCount = preferences.getUChar("count", 0);
+
   if (subscriberCount == 0) {
+    // First-ever boot (or NVS was cleared): seed the default AND persist it.
+    // Previously this only lived in RAM, so the very next add corrupted
+    // slot indexing and the default vanished after the next reboot.
     strncpy(subscribers[0], TARGET_PHONE_NUM, PHONE_LEN - 1);
     subscribers[0][PHONE_LEN - 1] = '\0';
     subscriberCount = 1;
-    Serial.printf("[NVS] No saved numbers. Default added: %s\n", subscribers[0]);
+    preferences.putString("sub0", subscribers[0]);
+    preferences.putUChar("count", subscriberCount);
+    Serial.printf("[NVS] No saved numbers. Default seeded & persisted: %s\n", subscribers[0]);
   } else {
+    uint8_t validCount = 0;
     for (uint8_t i = 0; i < subscriberCount; i++) {
       String key = "sub" + String(i);
       String num = preferences.getString(key.c_str(), "");
-      strncpy(subscribers[i], num.c_str(), PHONE_LEN - 1);
-      subscribers[i][PHONE_LEN - 1] = '\0';
-      Serial.printf("[NVS] Sub [%d]: %s\n", i, subscribers[i]);
+      if (num.length() == 0) {
+        Serial.printf("[NVS WARNING] Missing entry for key '%s' - skipping.\n", key.c_str());
+        continue;              // don't inject a blank number into the array
+      }
+      strncpy(subscribers[validCount], num.c_str(), PHONE_LEN - 1);
+      subscribers[validCount][PHONE_LEN - 1] = '\0';
+      Serial.printf("[NVS] Sub [%d]: %s\n", validCount, subscribers[validCount]);
+      validCount++;
     }
+    subscriberCount = validCount;   // self-heals any prior corruption
   }
   preferences.end();
 }
@@ -163,6 +176,43 @@ bool addSubscriberNVS(const char* newPhone) {
     preferences.putUChar("count", subscriberCount);
     preferences.end();
     Serial.printf("[NVS SUCCESS] Added sub #%d: %s\n", subscriberCount, newPhone);
+    return true;
+  }
+  Serial.println(F("[NVS ERROR] Could not open namespace for write."));
+  return false;
+}
+
+bool removeSubscriberNVS(const char* phone) {
+  if (!phone || strlen(phone) == 0) return false;
+  Serial.printf("[NVS] Attempting to remove subscriber: %s\n", phone);
+
+  int8_t foundIdx = -1;
+  for (uint8_t i = 0; i < subscriberCount; i++) {
+    if (strcmp(subscribers[i], phone) == 0) { foundIdx = i; break; }
+  }
+  if (foundIdx == -1) {
+    Serial.println(F("[NVS] Phone number not found."));
+    return false;
+  }
+
+  // Shift everything after foundIdx down by one
+  for (uint8_t i = foundIdx; i < subscriberCount - 1; i++) {
+    strncpy(subscribers[i], subscribers[i + 1], PHONE_LEN - 1);
+    subscribers[i][PHONE_LEN - 1] = '\0';
+  }
+  subscriberCount--;
+  memset(subscribers[subscriberCount], 0, PHONE_LEN);
+
+  // Rewrite the whole NVS table so keys stay contiguous (sub0..subN-1)
+  if (preferences.begin("gsm_subs", false)) {
+    preferences.clear();
+    for (uint8_t i = 0; i < subscriberCount; i++) {
+      String key = "sub" + String(i);
+      preferences.putString(key.c_str(), subscribers[i]);
+    }
+    preferences.putUChar("count", subscriberCount);
+    preferences.end();
+    Serial.printf("[NVS SUCCESS] Removed. New count: %d\n", subscriberCount);
     return true;
   }
   Serial.println(F("[NVS ERROR] Could not open namespace for write."));
@@ -392,6 +442,16 @@ bool initLoRaRadio() {
   return false;
 }
 
+void queueSubsUpdatePacket() {
+  JsonDocument doc;
+  doc["gsm_subs"] = subscriberCount;
+  char buf[48];
+  serializeJson(doc, buf, sizeof(buf));
+  if (xQueueSend(loraTxQueue, buf, 0) != pdTRUE) {
+    Serial.println(F("[LoRa TX] loraTxQueue full, subs-update packet dropped"));
+  }
+}
+
 void vTaskLoRaEngine(void *pvParameters) {
   Serial.println(F("[TASK] LoRa Engine Task Started."));
   if (!initLoRaRadio()) {
@@ -458,8 +518,13 @@ void vTaskLoRaEngine(void *pvParameters) {
             xQueueSend(gsmQueue, smsBuf, 0);
           } else if (strcmp(cmd, "GSM_ADD_SUB") == 0 && strlen(val) > 0) {
             addSubscriberNVS(val);
+            queueSubsUpdatePacket();
+          } else if (strcmp(cmd, "GSM_REMOVE_SUB") == 0 && strlen(val) > 0) {
+            removeSubscriberNVS(val);
+            queueSubsUpdatePacket();
           } else if (strcmp(cmd, "GSM_CLEAR_SUBS") == 0) {
             clearSubscribersNVS();
+            queueSubsUpdatePacket();
           }
         } else if (err) {
           Serial.printf("[LoRa RX ERROR] Deserialization failed: %s\n", err.c_str());
